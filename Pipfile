@@ -20,6 +20,9 @@ faster-whisper = "*"
 anthropic = "*"
 # DOCX 出力（export_docx=true）を使う場合のみ必要
 python-docx = "*"
+# OCR のフォールバック。Windows 内蔵 OCR が使える環境では不要
+# （onnxruntime を含め約100MB）
+rapidocr-onnxruntime = "*"
 
 [dev-packages]
 
