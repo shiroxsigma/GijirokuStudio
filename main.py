@@ -6,6 +6,7 @@ import time
 import queue
 import datetime
 import threading
+import traceback
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
@@ -28,6 +29,13 @@ LANG_OPTIONS = [
 
 # Sentinel placed on a capture queue to signal end-of-stream to the mixer.
 _EOF = object()
+
+# Per-speaker tracks. Mics are "me", speaker loopbacks are "them" — the two
+# roles are already physically separate, so no diarization model is needed.
+ROLE_SELF = "自分"
+ROLE_OTHER = "相手"
+ROLE_TRACK_SELF = "audio_self.mp3"
+ROLE_TRACK_OTHER = "audio_other.mp3"
 
 
 def _com_initialize():
@@ -84,6 +92,8 @@ class MeetingRecorderGUI:
         self._queue_overflow_count = 0
         self._meeting_name = ""
         self._rt_lang = None  # None = auto (ja/en detect), else fixed lang code
+        self._post_cancel = threading.Event()
+        self._post_running = False
 
         self._audio_devices = []        # list of enumerated device dicts
         self._audio_queues = []         # per-device capture queues (during recording)
@@ -267,7 +277,21 @@ class MeetingRecorderGUI:
             row_post, text="📄 議事録を生成（後処理）", bg="#0ea5e9", fg="white",
             font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=6,
             command=self._run_postprocess)
-        self.btn_postprocess.pack(fill="x")
+        self.btn_postprocess.pack(side="left", fill="x", expand=True)
+        self.btn_cancel_post = tk.Button(
+            row_post, text="✖ 中断", bg="#ef4444", fg="white",
+            font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=6,
+            command=self._cancel_postprocess, state="disabled")
+        self.btn_cancel_post.pack(side="right", padx=(6, 0))
+
+        row_prog = ttk.Frame(frame_ctrl)
+        row_prog.pack(fill="x", pady=(4, 0))
+        self.progress_post = ttk.Progressbar(row_prog, maximum=1000, value=0)
+        self.progress_post.pack(side="left", fill="x", expand=True)
+        self.label_progress = ttk.Label(row_prog, text="", width=30, anchor="w",
+            font=("BIZ UDゴシック", 8), foreground="#6b7280")
+        self.label_progress.pack(side="right", padx=(8, 0))
+
         self.label_status = ttk.Label(frame_ctrl, text="ステータス: 停止中",
             font=("BIZ UDゴシック", 10, "bold"), foreground="#6b7280")
         self.label_status.pack(anchor="w", pady=2)
@@ -531,43 +555,65 @@ class MeetingRecorderGUI:
             if self.combo_mode.current() == 1 and self._preloaded_transcriber is None:
                 self._preload_model()
 
-    def _run_postprocess(self):
-        initial_dir = self._last_record_dir if self._last_record_dir else None
-        folder = filedialog.askdirectory(
-            title="議事録生成対象フォルダを選択", initialdir=initial_dir)
+    def _run_postprocess(self, folder=None):
+        if self._post_running:
+            messagebox.showinfo("実行中", "後処理がすでに実行中です。")
+            return
+        if folder is None:
+            initial_dir = self._last_record_dir if self._last_record_dir else None
+            folder = filedialog.askdirectory(
+                title="議事録生成対象フォルダを選択", initialdir=initial_dir)
         if not folder:
             return
+        self._post_running = True
+        self._post_cancel.clear()
         self.btn_postprocess.config(state="disabled", text="⏳ 処理中...")
+        self.btn_cancel_post.config(state="normal", text="✖ 中断")
+        self.progress_post.config(value=0)
         self.label_status.config(text="ステータス: 議事録生成中...", foreground="#f59e0b")
-        self._log(f"後処理開始: {folder}")
         threading.Thread(target=self._postprocess_worker, args=(folder,), daemon=True).start()
 
-    def _postprocess_worker(self, folder):
-        import io
+    def _cancel_postprocess(self):
+        """Ask the worker to stop; it checks the flag at each phase boundary."""
+        self._post_cancel.set()
+        self.btn_cancel_post.config(state="disabled", text="中断中...")
+        self._log("後処理の中断を要求しました（現在の処理が終わり次第停止します）")
 
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        captured = io.StringIO()
+    def _post_progress(self, frac, msg):
+        """Progress callback — called from the worker thread."""
+        self.root.after(0, self._apply_post_progress, frac, msg)
+
+    def _apply_post_progress(self, frac, msg):
+        if frac is not None:
+            self.progress_post.config(value=max(0, min(1000, int(frac * 1000))))
+        short = msg if len(msg) <= 30 else msg[:29] + "…"
+        self.label_progress.config(text=short)
+        self._log(f"[後処理] {msg}")
+
+    def _postprocess_worker(self, folder):
+        result = "失敗"
         try:
-            sys.stdout = captured
-            sys.stderr = captured
-            post_process_folder(folder)
+            post_process_folder(folder, progress=self._post_progress,
+                                cancel=self._post_cancel.is_set)
+            result = "成功"
+        except PostProcessCancelled:
+            result = "中断"
         except Exception as e:
             self.root.after(0, self._log, f"[後処理エラー] {e}")
+            traceback.print_exc()
         finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-            output = captured.getvalue()
-            for line in output.strip().splitlines():
-                self.root.after(0, self._log, f"[後処理] {line}")
-            md_path = os.path.join(folder, "meeting_report.md")
-            result = "成功" if os.path.exists(md_path) else "失敗（Markdown未生成）"
+            self._post_running = False
             self.root.after(0, self._log, f"後処理完了 ({result})")
-            self.root.after(0, self.btn_postprocess.config,
-                {"state": "normal", "text": "📄 議事録を生成（後処理）"})
-            if not self.is_recording:
-                self.root.after(0, self.label_status.config,
-                    {"text": "ステータス: 停止中", "foreground": "#6b7280"})
+            self.root.after(0, self._finish_postprocess_ui, result)
+
+    def _finish_postprocess_ui(self, result):
+        self.btn_postprocess.config(state="normal", text="📄 議事録を生成（後処理）")
+        self.btn_cancel_post.config(state="disabled", text="✖ 中断")
+        self.label_progress.config(text="" if result == "成功" else result)
+        if result != "成功":
+            self.progress_post.config(value=0)
+        if not self.is_recording:
+            self.label_status.config(text="ステータス: 停止中", foreground="#6b7280")
 
     def _open_settings_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1655,16 +1701,110 @@ def apply_glossary(lines, terms):
     return changed
 
 
-def post_process_folder(folder):
-    """Transcribe audio in a meeting folder and generate combined markdown."""
-    print(f"GijirokuStudio Post-Processor")
-    print(f"Folder: {folder}")
-    print()
+def decode_audio_16k_mono(path):
+    """Decode any audio file to a float32 mono 16kHz array (whisper's input)."""
+    import wave
+    tmp = f"{path}._tmp16k.wav"
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", path, "-ar", "16000", "-ac", "1", "-f", "wav", tmp],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        creationflags=flags)
+    try:
+        with wave.open(tmp, "rb") as wf:
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0, sr
 
+
+class PostProcessCancelled(Exception):
+    """Raised at a checkpoint when the caller asked to stop post-processing."""
+
+
+class _Reporter:
+    """Progress reporting plus cancellation, threaded through post-processing.
+
+    Calling it announces a phase; `check()` is the cheap cancel-only probe for
+    tight loops where a log line per iteration would be noise.
+    """
+
+    def __init__(self, progress=None, cancel=None):
+        self._progress = progress
+        self._cancel = cancel
+
+    def __call__(self, frac, msg):
+        print(msg)
+        if self._progress is not None:
+            try:
+                self._progress(frac, msg)
+            except Exception as e:
+                print(f"[進捗通知警告] {e}")
+        self.check()
+
+    def check(self):
+        if self._cancel is not None and self._cancel():
+            raise PostProcessCancelled()
+
+
+# ------------------------------------------------------- Meeting data loading
+
+def _read_jsonl(path):
+    """Read a .jsonl log, tolerating a truncated or corrupt trailing line."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"[ログ警告] 壊れた行を無視: {os.path.basename(path)}")
+    return rows
+
+
+def _read_metadata(folder):
+    meta = {}
+    path = os.path.join(folder, "metadata.txt")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    meta[k] = v
+    return meta
+
+
+def _image_time_from_name(fname, start_time_str):
+    """Elapsed seconds from a snapshot_HHMMSS_mmm.jpg name (pre-jsonl folders)."""
+    if not start_time_str:
+        return None
+    try:
+        hhmmss = os.path.splitext(fname)[0].split("_")[1]
+        h, m, s = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+        st = datetime.datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+        return (st.replace(hour=h, minute=m, second=s) - st).total_seconds()
+    except Exception:
+        return None
+
+
+def collect_meeting_data(folder):
+    """Gather everything a recording folder holds into one structure.
+
+    Every renderer (markdown / HTML / DOCX) consumes this dict. None of them
+    parses another renderer's output — that coupling would break the moment a
+    heading or a table changes.
+    """
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"Folder not found: {folder}")
 
-    # Find audio file
     audio_file = None
     for name in ("audio_main.mp3", "audio_main.wav"):
         path = os.path.join(folder, name)
@@ -1673,239 +1813,335 @@ def post_process_folder(folder):
             break
     if audio_file is None:
         raise RuntimeError(f"No audio file found in: {folder}")
-    print(f"Audio: {os.path.basename(audio_file)}")
 
-    # Read metadata
-    meta = {}
-    meta_path = os.path.join(folder, "metadata.txt")
-    if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if "=" in line:
-                    k, v = line.strip().split("=", 1)
-                    meta[k] = v
-    start_time_str = meta.get("START_TIME_STR", "Unknown")
-    default_lang = meta.get("LANGUAGE", "ja")
-    auto_mode = default_lang == "auto"
-    meeting_name = meta.get("MEETING_NAME", "")
-    print(f"Language: {'auto (ja/en)' if auto_mode else default_lang}")
+    meta = _read_metadata(folder)
 
-    # Read language segments
-    lang_segments = []
-    seg_path = os.path.join(folder, "language_segments.jsonl")
-    if os.path.exists(seg_path):
-        with open(seg_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    lang_segments.append(json.loads(line))
-        print(f"Language segments: {len(lang_segments)}")
+    # Per-role tracks, written only when both a mic and a speaker were captured.
+    role_tracks = {}
+    for role, fname in ((ROLE_SELF, ROLE_TRACK_SELF), (ROLE_OTHER, ROLE_TRACK_OTHER)):
+        path = os.path.join(folder, fname)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            role_tracks[role] = path
 
-    # List images sorted by name
-    images = sorted(
-        [f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
-    print(f"Images: {len(images)}")
-
-    # Load image entries — prefer snapshots.jsonl, fall back to filename parsing
+    # Image entries — snapshots.jsonl is authoritative, filenames are fallback
     img_entries = []
-    snap_log_path = os.path.join(folder, "snapshots.jsonl")
-    if os.path.exists(snap_log_path):
-        with open(snap_log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entry = json.loads(line)
-                    img_entries.append({
-                        "file": entry["file"],
-                        "time": entry["elapsed"],
-                        "type": entry.get("type", "auto"),
-                    })
-        print(f"Image entries (from snapshots.jsonl): {len(img_entries)}")
-    else:
-        # Fallback: parse timestamps from filenames
-        def parse_image_time(fname):
-            try:
-                parts = fname.replace(".jpg", "").replace(".jpeg", "").replace(".png", "").split("_")
-                hhmmss = parts[1]
-                h, m, s = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
-                if "START_TIME_STR" in meta:
-                    st = datetime.datetime.strptime(meta["START_TIME_STR"], "%Y-%m-%d %H:%M:%S")
-                    img_time = st.replace(hour=h, minute=m, second=s)
-                    return (img_time - st).total_seconds()
-            except Exception:
-                pass
-            return None
-
-        for img in images:
-            t = parse_image_time(img)
+    for entry in _read_jsonl(os.path.join(folder, "snapshots.jsonl")):
+        img_entries.append({
+            "file": entry["file"],
+            "time": entry.get("elapsed", 0.0),
+            "type": entry.get("type", "auto"),
+        })
+    if not img_entries:
+        start_str = meta.get("START_TIME_STR")
+        for fname in sorted(f for f in os.listdir(folder)
+                            if f.lower().endswith((".jpg", ".jpeg", ".png"))):
+            t = _image_time_from_name(fname, start_str)
             if t is not None:
-                img_entries.append({"file": img, "time": t, "type": "auto"})
-        print(f"Image entries (from filename parsing): {len(img_entries)}")
+                img_entries.append({"file": fname, "time": t, "type": "auto"})
     img_entries.sort(key=lambda x: x["time"])
 
-    # Decode audio to float32 16kHz mono
-    wav_tmp = os.path.join(folder, "_tmp_16k.wav")
-    subprocess.run(
-        [FFMPEG_PATH, "-y", "-i", audio_file,
-         "-ar", "16000", "-ac", "1", "-f", "wav", wav_tmp],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    # OCR text is cached so re-running post-processing never redoes it
+    ocr_by_file = {e.get("file"): e.get("text", "")
+                   for e in _read_jsonl(os.path.join(folder, "ocr.jsonl"))}
+    for ent in img_entries:
+        ent["ocr"] = ocr_by_file.get(ent["file"], "")
 
-    import wave
-    with wave.open(wav_tmp, "rb") as wf:
-        n_frames = wf.getnframes()
-        sr = wf.getframerate()
-        raw = wf.readframes(n_frames)
-    os.remove(wav_tmp)
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    duration = len(audio) / sr
-    print(f"Audio duration: {duration:.1f}s ({sr}Hz)")
+    lang = meta.get("LANGUAGE", "ja")
+    return {
+        "folder": folder,
+        "meta": meta,
+        "meeting_name": meta.get("MEETING_NAME", ""),
+        "start_time_str": meta.get("START_TIME_STR", "Unknown"),
+        "audio_source": meta.get("AUDIO_SOURCE", "-"),
+        "language": lang,
+        "auto_mode": lang == "auto",
+        "audio_file": audio_file,
+        "audio_name": os.path.basename(audio_file),
+        "role_tracks": role_tracks,
+        "lang_segments": _read_jsonl(os.path.join(folder, "language_segments.jsonl")),
+        "images": img_entries,
+        "markers": sorted(_read_jsonl(os.path.join(folder, "markers.jsonl")),
+                          key=lambda m: m.get("elapsed", 0.0)),
+        "duration": 0.0,
+        "detected_langs": [],
+        "lines": [],
+        "summary": None,
+    }
 
-    # Transcribe — segment by language if segments exist, else single pass.
+
+# ---------------------------------------------------------------- Transcribing
+
+class _WhisperEngine:
+    """One interface over faster-whisper and the moonshine-voice fallback."""
+
+    def __init__(self, prompt, report):
+        self.prompt = prompt
+        self.model = None
+        self.name = "moonshine-voice"
+        try:
+            from faster_whisper import WhisperModel
+            cfg = load_app_settings()
+            model_name = cfg.get("whisper_model", "large-v3-turbo")
+            device = cfg.get("whisper_device", "cpu")
+            compute = cfg.get("whisper_compute", "int8")
+            report(None, f"モデル読み込み中: {model_name} ({device})")
+            self.model = WhisperModel(model_name, device=device, compute_type=compute)
+            self.name = f"faster-whisper ({model_name})"
+        except ImportError:
+            report(None, "faster-whisper 未導入 → moonshine-voice にフォールバック")
+
+    def detect_language(self, clip):
+        return detect_ja_en(self.model, clip) if self.model is not None else "ja"
+
+    def transcribe(self, clip, lang, sr):
+        """Yield (start_seconds_within_clip, text) for one audio window."""
+        if self.model is not None:
+            segments, _info = self.model.transcribe(
+                clip, language=lang, initial_prompt=self.prompt,
+                vad_filter=True, beam_size=5)
+            for seg in segments:
+                text = seg.text.strip()
+                if text:
+                    yield (seg.start or 0.0), text
+            return
+        from moonshine_voice import Transcriber, get_model_for_language
+        model_path, arch = get_model_for_language(
+            "ja" if lang in (None, "auto") else lang)
+        transcriber = Transcriber(model_path=model_path, model_arch=arch)
+        try:
+            transcript = transcriber.transcribe_without_streaming(clip.tolist(), sr)
+        finally:
+            transcriber.close()
+        for line in transcript.lines:
+            if line.text.strip():
+                yield (line.start_time or 0.0), line.text.strip()
+
+
+def _lang_at(lang_segments, elapsed, default_lang):
+    """Language in force at a given elapsed second, per the switch log."""
+    lang = default_lang
+    for seg in sorted(lang_segments, key=lambda s: s.get("elapsed", 0.0)):
+        if seg.get("elapsed", 0.0) <= elapsed:
+            lang = seg.get("lang", lang)
+        else:
+            break
+    return lang
+
+
+def transcribe_meeting(data, report, span=(0.10, 0.80)):
+    """Transcribe every audio track of a meeting into data["lines"].
+
+    When per-role tracks exist the mixed audio is skipped: transcribing it as
+    well would cover the same speech a third time for no benefit. Each track is
+    cut into VAD speech windows first, so silence — most of a role track, since
+    only one side speaks at a time — costs nothing.
+    """
     terms = load_glossary()
     prompt = build_whisper_prompt(terms)
     print(f"Glossary terms: {len(terms)}")
 
-    lines = []
-
-    # Choose engine: faster-whisper when available (vocabulary-biased, VAD),
-    # otherwise fall back to the original moonshine-voice path.
-    using_faster_whisper = False
-    model = None
-    try:
-        from faster_whisper import WhisperModel
-        cfg = load_app_settings()
-        w_model = cfg.get("whisper_model", "large-v3-turbo")
-        w_device = cfg.get("whisper_device", "cpu")
-        w_compute = cfg.get("whisper_compute", "int8")
-        print(f"Transcribing with faster-whisper ({w_model} / {w_device})...")
-        model = WhisperModel(w_model, device=w_device, compute_type=w_compute)
-        using_faster_whisper = True
-
-        def _transcribe(clip_audio, lang, offset):
-            segs, info = model.transcribe(
-                clip_audio, language=lang, initial_prompt=prompt,
-                vad_filter=True, beam_size=5)
-            for s in segs:
-                txt = s.text.strip()
-                if txt:
-                    lines.append({"text": txt, "start": offset + (s.start or 0.0)})
-    except ImportError:
-        print("faster-whisper 未インストール → moonshine-voice でフォールバック")
-        from moonshine_voice import Transcriber, get_model_for_language
-
-        def _transcribe(clip_audio, lang, offset):
-            if lang == "auto":
-                lang = "ja"  # moonshine can't auto-detect language
-            model_path, model_arch = get_model_for_language(lang)
-            transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
-            transcript = transcriber.transcribe_without_streaming(clip_audio.tolist(), sr)
-            transcriber.close()
-            for line in transcript.lines:
-                if line.text.strip():
-                    abs_start = offset + (line.start_time if line.start_time else 0.0)
-                    lines.append({"text": line.text.strip(), "start": abs_start})
-
-    detected_langs = set()
-
-    if auto_mode:
-        # Auto JA/EN: ignore any recorded lang_segments and instead detect
-        # the language independently for each VAD-grouped speech window.
-        print("Auto language mode: detecting ja/en per speech window")
-        for start_sample, end_sample in iter_speech_windows(audio, sr):
-            seg_audio = audio[start_sample:end_sample]
-            start_s = start_sample / sr
-            end_s = end_sample / sr
-            if len(seg_audio) < sr * 0.5:  # skip very short windows
-                continue
-            lang = detect_ja_en(model, seg_audio) if using_faster_whisper else "ja"
-            detected_langs.add(lang)
-            print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] auto -> {lang}...")
-            _transcribe(seg_audio, lang, start_s)
+    if data["role_tracks"]:
+        tracks = [(path, role) for role, path in sorted(data["role_tracks"].items())]
+        report(None, f"話者別トラック: {' / '.join(r for _, r in tracks)}")
     else:
-        # Build clip list: [(start_s, end_s, lang, label), ...]
-        if lang_segments:
-            segments = sorted(
-                ({"start": seg["elapsed"], "lang": seg["lang"],
-                  "label": seg.get("label", seg["lang"])} for seg in lang_segments),
-                key=lambda x: x["start"])
-            clips = []
-            for i, seg in enumerate(segments):
-                end_s = segments[i + 1]["start"] if i + 1 < len(segments) else duration
-                clips.append((seg["start"], end_s, seg["lang"], seg["label"]))
-        else:
-            clips = [(0.0, duration, default_lang, default_lang)]
+        tracks = [(data["audio_file"], None)]
 
-        for start_s, end_s, lang, label in clips:
-            start_sample = int(start_s * sr)
-            end_sample = min(int(end_s * sr), len(audio))
-            seg_audio = audio[start_sample:end_sample]
-            if len(seg_audio) < sr * 0.5:  # skip very short segments
-                print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] {label}: skipped (< 0.5s)")
-                continue
-            print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] {label}...")
-            _transcribe(seg_audio, lang, start_s)
+    engine = _WhisperEngine(prompt, report)
+    data["engine"] = engine.name
 
-    if auto_mode:
-        print(f"Detected languages: {', '.join(sorted(detected_langs)) if detected_langs else '-'}")
+    lines = []
+    detected = set()
+    auto_mode = data["auto_mode"]
+    default_lang = "ja" if auto_mode else data["language"]
+    lo, hi = span
+    per_track = (hi - lo) / len(tracks)
 
-    # Post-hoc glossary correction (alias -> canonical form)
+    for t_idx, (path, speaker) in enumerate(tracks):
+        base = lo + per_track * t_idx
+        tag = f"[{speaker}] " if speaker else ""
+        report(base, f"{tag}音声をデコード中...")
+        audio, sr = decode_audio_16k_mono(path)
+        duration = len(audio) / sr
+        data["duration"] = max(data["duration"], duration)
+
+        windows = [w for w in iter_speech_windows(audio, sr)
+                   if (w[1] - w[0]) >= sr * 0.5]
+        spoken = sum((e - s) / sr for s, e in windows) or 1.0
+        report(base, f"{tag}発話区間 {len(windows)}件 / {spoken:.0f}秒")
+
+        done = 0.0
+        for start_sample, end_sample in windows:
+            clip = audio[start_sample:end_sample]
+            start_s = start_sample / sr
+            lang = (engine.detect_language(clip) if auto_mode
+                    else _lang_at(data["lang_segments"], start_s, default_lang))
+            detected.add(lang)
+            report(base + per_track * (done / spoken),
+                   f"{tag}文字起こし {done:.0f}/{spoken:.0f}秒 [{start_s:.0f}s〜] {lang}")
+            for offset, text in engine.transcribe(clip, lang, sr):
+                lines.append({"start": start_s + offset, "text": text,
+                              "speaker": speaker})
+                # faster-whisper decodes lazily as segments are consumed, so a
+                # cancel lands mid-window instead of waiting 25 seconds for one.
+                report.check()
+            done += (end_sample - start_sample) / sr
+        del audio
+
     corrected = apply_glossary(lines, terms)
     if corrected:
-        print(f"Glossary corrections applied: {corrected} lines")
+        print(f"用語辞書による補正: {corrected}行")
 
-    lines.sort(key=lambda x: x["start"])
-    print(f"Transcription lines: {len(lines)}")
+    # Stable order: same instant sorts 相手 before 自分 so overlaps read the same
+    # way every run.
+    rank = {ROLE_OTHER: 0, ROLE_SELF: 1}
+    lines.sort(key=lambda l: (l["start"], rank.get(l.get("speaker"), 9)))
+    data["lines"] = lines
+    data["detected_langs"] = sorted(detected)
+    report(hi, f"文字起こし完了: {len(lines)}行")
+    return lines
 
-    # Generate markdown
-    md_path = os.path.join(folder, "meeting_report.md")
-    with open(md_path, "w", encoding="utf-8") as f:
-        title = meeting_name if meeting_name else start_time_str
+
+# ------------------------------------------------------------------ Rendering
+
+def fmt_timestamp(seconds):
+    """mm:ss, widening to h:mm:ss once a meeting passes the hour."""
+    total = int(max(0.0, seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def build_timeline(data):
+    """Merge transcript lines, screenshots and markers into one ordered stream."""
+    events = []
+    for line in data["lines"]:
+        events.append({"t": line["start"], "kind": "line", "data": line})
+    for img in data["images"]:
+        events.append({"t": img["time"], "kind": "image", "data": img})
+    for marker in data["markers"]:
+        events.append({"t": marker.get("elapsed", 0.0), "kind": "marker",
+                       "data": marker})
+    # At an identical timestamp: marker, then the slide it refers to, then speech
+    order = {"marker": 0, "image": 1, "line": 2}
+    events.sort(key=lambda e: (e["t"], order.get(e["kind"], 9)))
+    return events
+
+
+def meeting_facts(data):
+    """The metadata table shared by every renderer, as (label, value) pairs."""
+    facts = []
+    if data["meeting_name"]:
+        facts.append(("会議名", data["meeting_name"]))
+    facts.append(("開始時刻", data["start_time_str"]))
+    dur = data["duration"]
+    facts.append(("録音時間", f"{dur:.0f}秒 ({dur / 60:.1f}分)"))
+    facts.append(("画像数", str(len(data["images"]))))
+    if data["markers"]:
+        facts.append(("マーカー", f"{len(data['markers'])}件"))
+    facts.append(("音声ソース", data["audio_source"]))
+    if data["role_tracks"]:
+        facts.append(("話者分離", " / ".join(sorted(data["role_tracks"]))))
+    if data["auto_mode"]:
+        detected = "/".join(data["detected_langs"]) if data["detected_langs"] else "-"
+        facts.append(("言語", f"自動 (ja/en) — 検出: {detected}"))
+    else:
+        facts.append(("言語", data["language"]))
+    if data["lang_segments"] and not data["auto_mode"]:
+        facts.append(("言語切替", ", ".join(
+            f"{s.get('label', s.get('lang'))} ({s.get('elapsed', 0):.0f}s〜)"
+            for s in data["lang_segments"])))
+    if data.get("engine"):
+        facts.append(("文字起こし", data["engine"]))
+    return facts
+
+
+def render_markdown(data, path):
+    """Write meeting_report.md from collected data."""
+    with open(path, "w", encoding="utf-8") as f:
+        title = data["meeting_name"] or data["start_time_str"]
         f.write(f"# 会議記録 - {title}\n\n")
-        f.write(f"| 項目 | 値 |\n|---|---|\n")
-        if meeting_name:
-            f.write(f"| 会議名 | {meeting_name} |\n")
-        f.write(f"| 開始時刻 | {start_time_str} |\n")
-        f.write(f"| 録音時間 | {duration:.0f}s ({duration/60:.1f}min) |\n")
-        f.write(f"| 画像数 | {len(img_entries)} |\n")
-        f.write(f"| 音声ソース | {meta.get('AUDIO_SOURCE', '-')} |\n")
-        if auto_mode:
-            detected_str = "/".join(sorted(detected_langs)) if detected_langs else "-"
-            f.write(f"| 言語 | 自動 (ja/en) — 検出: {detected_str} |\n")
-        else:
-            f.write(f"| 言語 | {default_lang} |\n")
-        if lang_segments and not auto_mode:
-            lang_summary = ", ".join(
-                f"{s.get('label', s['lang'])} ({s['start']:.0f}s〜)" for s in lang_segments)
-            f.write(f"| 言語切替 | {lang_summary} |\n")
-        f.write("\n---\n\n")
+        f.write("| 項目 | 値 |\n|---|---|\n")
+        for label, value in meeting_facts(data):
+            f.write(f"| {label} | {value} |\n")
+        f.write("\n")
 
-        # Merge images and transcription by time
-        li = 0  # line index
-        ii = 0  # image index
+        summary = data.get("summary")
+        if summary:
+            f.write(render_summary_markdown(summary))
 
-        while li < len(lines) or ii < len(img_entries):
-            line_time = lines[li]["start"] if li < len(lines) else float('inf')
-            img_time = img_entries[ii]["time"] if ii < len(img_entries) else float('inf')
-
-            if img_time <= line_time and ii < len(img_entries):
-                ent = img_entries[ii]
-                m, s = divmod(int(ent["time"]), 60)
-                tag = "自動" if ent.get("type") == "auto" else "手動"
-                f.write(f"### [{m:02d}:{s:02d}] 画面キャプチャ ({tag})\n\n")
-                f.write(f"![{ent['file']}]({ent['file']})\n\n")
-                ii += 1
-            elif li < len(lines):
-                ln = lines[li]
-                m, s = divmod(int(ln["start"]), 60)
-                f.write(f"**[{m:02d}:{s:02d}]** {ln['text']}\n\n")
-                li += 1
+        f.write("---\n\n## 記録\n\n")
+        for event in build_timeline(data):
+            ts = fmt_timestamp(event["t"])
+            item = event["data"]
+            if event["kind"] == "image":
+                tag = "自動" if item.get("type") == "auto" else "手動"
+                f.write(f"### [{ts}] 画面キャプチャ ({tag})\n\n")
+                f.write(f"![{item['file']}]({item['file']})\n\n")
+                if item.get("ocr"):
+                    f.write("<details><summary>スライド内テキスト (OCR)</summary>\n\n")
+                    f.write("```\n" + item["ocr"].strip() + "\n```\n\n")
+                    f.write("</details>\n\n")
+            elif event["kind"] == "marker":
+                label = item.get("label") or "重要"
+                f.write(f"> ⭐ **[{ts}] {label}**\n\n")
+            else:
+                speaker = item.get("speaker")
+                who = f" {speaker}:" if speaker else ""
+                f.write(f"**[{ts}]{who}** {item['text']}\n\n")
 
         f.write("---\n\n")
-        f.write("*Generated by GijirokuStudio v2*\n")
+        f.write("*Generated by GijirokuStudio*\n")
+    return path
 
-    print(f"\nDone! Markdown saved to: {md_path}")
-    print(f"  - {len(lines)} transcription lines")
-    print(f"  - {len(img_entries)} images")
+
+def render_summary_markdown(summary):
+    """The AI summary block, shared by the markdown and DOCX renderers."""
+    out = ["## 📋 サマリ\n\n"]
+    if summary.get("summary"):
+        out.append(summary["summary"].strip() + "\n\n")
+    if summary.get("decisions"):
+        out.append("### 決定事項\n\n")
+        out.extend(f"- {d}\n" for d in summary["decisions"])
+        out.append("\n")
+    if summary.get("action_items"):
+        out.append("### アクションアイテム\n\n")
+        out.append("| タスク | 担当 | 期限 |\n|---|---|---|\n")
+        for item in summary["action_items"]:
+            out.append(f"| {item.get('task', '')} | {item.get('owner') or '-'} "
+                       f"| {item.get('due') or '-'} |\n")
+        out.append("\n")
+    if summary.get("open_issues"):
+        out.append("### 未決事項\n\n")
+        out.extend(f"- {q}\n" for q in summary["open_issues"])
+        out.append("\n")
+    if summary.get("raw"):
+        out.append("### AI要約（未整形）\n\n```\n" + summary["raw"].strip() + "\n```\n\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------- Entry point
+
+def post_process_folder(folder, progress=None, cancel=None):
+    """Transcribe a meeting folder and generate the report files.
+
+    progress: optional callable(fraction | None, message) for UI feedback.
+              Post-processing a one-hour meeting takes tens of minutes on CPU,
+              so every phase reports where it is.
+    cancel:   optional callable() -> bool, polled at each checkpoint. When it
+              returns True, PostProcessCancelled is raised.
+    """
+    report = _Reporter(progress, cancel)
+    report(0.0, f"後処理開始: {os.path.basename(folder)}")
+    data = collect_meeting_data(folder)
+    report(0.02, f"音声: {data['audio_name']} / 画像: {len(data['images'])}枚")
+
+    transcribe_meeting(data, report, span=(0.05, 0.80))
+
+    md_path = os.path.join(folder, "meeting_report.md")
+    render_markdown(data, md_path)
+    report(1.0, f"議事録を出力しました: {os.path.basename(md_path)}")
+    print(f"  - 発言 {len(data['lines'])}行 / 画像 {len(data['images'])}枚")
+    return md_path
 
 
 # ======================================================================
