@@ -18,6 +18,8 @@ faster-whisper = "*"
 # AI要約で summary_provider="claude" を選ぶ場合のみ必要
 # （Ollama とローカル完結の利用時は不要）
 anthropic = "*"
+# DOCX 出力（export_docx=true）を使う場合のみ必要
+python-docx = "*"
 
 [dev-packages]
 

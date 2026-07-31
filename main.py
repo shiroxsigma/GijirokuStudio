@@ -8,6 +8,8 @@ import datetime
 import threading
 import traceback
 import subprocess
+import base64
+import html
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
@@ -2419,6 +2421,305 @@ def render_summary_markdown(summary):
     return "".join(out)
 
 
+# ------------------------------------------------------- HTML / DOCX export
+
+HTML_STYLE = """
+:root { color-scheme: light dark; --fg:#1f2937; --bg:#ffffff; --mut:#6b7280;
+        --line:#e5e7eb; --accent:#0ea5e9; --mark:#f59e0b; --card:#f9fafb; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e5e7eb; --bg:#111827; --mut:#9ca3af; --line:#374151;
+          --accent:#38bdf8; --mark:#fbbf24; --card:#1f2937; } }
+* { box-sizing: border-box; }
+body { margin:0; padding:0 0 4rem; background:var(--bg); color:var(--fg);
+       font-family:"BIZ UDPゴシック","Yu Gothic UI","Hiragino Sans",sans-serif;
+       line-height:1.75; }
+.wrap { max-width:52rem; margin:0 auto; padding:0 1.2rem; }
+h1 { font-size:1.6rem; margin:1.5rem 0 .5rem; }
+h2 { font-size:1.2rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--line);
+     padding-bottom:.3rem; }
+h3 { font-size:1rem; margin:1.4rem 0 .4rem; color:var(--mut); }
+table { border-collapse:collapse; width:100%; margin:.6rem 0; font-size:.9rem; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left;
+        vertical-align:top; }
+th { background:var(--card); white-space:nowrap; }
+.meta td:first-child { white-space:nowrap; color:var(--mut); width:8rem; }
+.scroll { overflow-x:auto; }
+.player { position:sticky; top:0; z-index:10; background:var(--bg);
+          border-bottom:1px solid var(--line); padding:.6rem 0; }
+.player audio { width:100%; }
+.tools { display:flex; gap:.5rem; align-items:center; margin:.5rem 0 0; }
+.tools input { flex:1; padding:.4rem .6rem; border:1px solid var(--line);
+               border-radius:.3rem; background:var(--bg); color:var(--fg);
+               font-size:.9rem; }
+.line { display:flex; gap:.6rem; padding:.15rem 0; scroll-margin-top:6rem; }
+.line.hide { display:none; }
+.t { flex:none; font-variant-numeric:tabular-nums; font-size:.8rem;
+     color:var(--accent); background:none; border:0; padding:.1rem .2rem;
+     cursor:pointer; font-family:inherit; }
+.t:hover { text-decoration:underline; }
+.who { flex:none; font-size:.8rem; color:var(--mut); min-width:2.6rem; }
+.said { flex:1; }
+.marker { margin:.8rem 0; padding:.4rem .8rem; border-left:4px solid var(--mark);
+          background:var(--card); font-weight:bold; }
+figure { margin:1.2rem 0; }
+figure img { max-width:100%; border:1px solid var(--line); border-radius:.3rem;
+             display:block; }
+figcaption { font-size:.8rem; color:var(--mut); margin-top:.3rem; }
+details { margin:.4rem 0; font-size:.85rem; }
+details pre { white-space:pre-wrap; background:var(--card); padding:.6rem;
+              border-radius:.3rem; margin:.4rem 0 0; }
+.hit { background:rgba(245,158,11,.25); }
+footer { color:var(--mut); font-size:.8rem; margin-top:2.5rem;
+         border-top:1px solid var(--line); padding-top:.8rem; }
+@media print { .player, .tools { position:static; } .t { color:var(--mut); } }
+"""
+
+HTML_SCRIPT = """
+(function () {
+  var audio = document.getElementById('player');
+  document.querySelectorAll('[data-t]').forEach(function (el) {
+    el.addEventListener('click', function () {
+      if (!audio) return;
+      audio.currentTime = parseFloat(el.dataset.t) || 0;
+      audio.play();
+    });
+  });
+  var box = document.getElementById('q');
+  if (box) {
+    box.addEventListener('input', function () {
+      var q = box.value.trim();
+      document.querySelectorAll('.line').forEach(function (el) {
+        var said = el.querySelector('.said');
+        var text = said.textContent;
+        el.classList.toggle('hide', q !== '' && text.indexOf(q) === -1);
+        said.innerHTML = '';
+        if (q === '' || text.indexOf(q) === -1) { said.textContent = text; return; }
+        var i = 0, at;
+        while ((at = text.indexOf(q, i)) !== -1) {
+          said.appendChild(document.createTextNode(text.slice(i, at)));
+          var m = document.createElement('mark');
+          m.className = 'hit';
+          m.textContent = q;
+          said.appendChild(m);
+          i = at + q.length;
+        }
+        said.appendChild(document.createTextNode(text.slice(i)));
+      });
+    });
+  }
+})();
+"""
+
+
+def _data_uri(path, mime):
+    """base64 data: URI for a file, or None if it can't be read."""
+    try:
+        with open(path, "rb") as f:
+            return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        print(f"[HTML警告] 埋め込めません {os.path.basename(path)}: {e}")
+        return None
+
+
+def _shrink_audio_for_embed(src):
+    """Re-encode to 64kbps mono for embedding — a 192kbps hour is ~115MB in base64."""
+    tmp = f"{src}._embed.mp3"
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    subprocess.run([FFMPEG_PATH, "-y", "-i", src, "-ac", "1", "-b:a", "64k", tmp],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=True, creationflags=flags)
+    return tmp
+
+
+def render_html(data, path, embed_audio=False, embed_images=True):
+    """Write a shareable single-page report from collected data.
+
+    Images are inlined so the file survives being emailed on its own. Audio is
+    referenced by relative path unless `embed_audio` is set: an hour of 192kbps
+    MP3 becomes ~115MB once base64-encoded, which no browser enjoys opening.
+    """
+    esc = html.escape
+    folder = data["folder"]
+    title = data["meeting_name"] or data["start_time_str"]
+    out = []
+    add = out.append
+
+    add("<!DOCTYPE html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n")
+    add('<meta name="viewport" content="width=device-width,initial-scale=1">\n')
+    add(f"<title>会議記録 - {esc(title)}</title>\n<style>{HTML_STYLE}</style>\n")
+    add("</head>\n<body>\n<div class=\"wrap\">\n")
+    add(f"<h1>会議記録 - {esc(title)}</h1>\n")
+
+    audio_src = data["audio_name"]
+    tmp_audio = None
+    if embed_audio:
+        try:
+            tmp_audio = _shrink_audio_for_embed(data["audio_file"])
+            uri = _data_uri(tmp_audio, "audio/mpeg")
+            if uri:
+                audio_src = uri
+        except Exception as e:
+            print(f"[HTML警告] 音声を埋め込めません: {e}")
+    add('<div class="player">\n')
+    add(f'<audio id="player" controls preload="none" src="{audio_src}"></audio>\n')
+    add('<div class="tools"><input id="q" type="search" '
+        'placeholder="発言を検索（クリックでその時刻から再生）"></div>\n')
+    add("</div>\n")
+    if tmp_audio:
+        try:
+            os.remove(tmp_audio)
+        except OSError:
+            pass
+
+    add('<div class="scroll"><table class="meta"><tbody>\n')
+    for label, value in meeting_facts(data):
+        add(f"<tr><td>{esc(label)}</td><td>{esc(str(value))}</td></tr>\n")
+    add("</tbody></table></div>\n")
+
+    summary = data.get("summary")
+    if summary:
+        add('<h2>📋 サマリ</h2>\n')
+        if summary.get("summary"):
+            add(f"<p>{esc(summary['summary']).replace(chr(10), '<br>')}</p>\n")
+        if summary.get("decisions"):
+            add("<h3>決定事項</h3>\n<ul>\n")
+            add("".join(f"<li>{esc(d)}</li>\n" for d in summary["decisions"]))
+            add("</ul>\n")
+        if summary.get("action_items"):
+            add("<h3>アクションアイテム</h3>\n<div class=\"scroll\"><table>\n")
+            add("<thead><tr><th>タスク</th><th>担当</th><th>期限</th></tr></thead><tbody>\n")
+            for item in summary["action_items"]:
+                add(f"<tr><td>{esc(item.get('task', ''))}</td>"
+                    f"<td>{esc(item.get('owner') or '-')}</td>"
+                    f"<td>{esc(item.get('due') or '-')}</td></tr>\n")
+            add("</tbody></table></div>\n")
+        if summary.get("open_issues"):
+            add("<h3>未決事項</h3>\n<ul>\n")
+            add("".join(f"<li>{esc(q)}</li>\n" for q in summary["open_issues"]))
+            add("</ul>\n")
+        if summary.get("raw"):
+            add("<h3>AI要約（未整形）</h3>\n"
+                f"<pre>{esc(summary['raw'])}</pre>\n")
+
+    add("<h2>記録</h2>\n")
+    for event in build_timeline(data):
+        ts = fmt_timestamp(event["t"])
+        item = event["data"]
+        seek = f'{event["t"]:.1f}'
+        if event["kind"] == "image":
+            src = item["file"]
+            if embed_images:
+                uri = _data_uri(os.path.join(folder, item["file"]), "image/jpeg")
+                if uri:
+                    src = uri
+            tag = "自動" if item.get("type") == "auto" else "手動"
+            add("<figure>\n")
+            add(f'<button class="t" data-t="{seek}">[{ts}]</button> '
+                f'<span class="who">画面キャプチャ ({tag})</span>\n')
+            add(f'<img src="{src}" alt="{esc(item["file"])}" loading="lazy">\n')
+            add(f"<figcaption>{esc(item['file'])}</figcaption>\n")
+            if item.get("ocr"):
+                add("<details><summary>スライド内テキスト (OCR)</summary>"
+                    f"<pre>{esc(item['ocr'].strip())}</pre></details>\n")
+            add("</figure>\n")
+        elif event["kind"] == "marker":
+            label = item.get("label") or "重要"
+            add(f'<div class="marker"><button class="t" data-t="{seek}">[{ts}]</button> '
+                f'⭐ {esc(label)}</div>\n')
+        else:
+            who = item.get("speaker") or ""
+            add('<div class="line">'
+                f'<button class="t" data-t="{seek}">[{ts}]</button>'
+                f'<span class="who">{esc(who)}</span>'
+                f'<span class="said">{esc(item["text"])}</span></div>\n')
+
+    add("<footer>Generated by GijirokuStudio</footer>\n</div>\n")
+    add(f"<script>{HTML_SCRIPT}</script>\n</body>\n</html>\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > 40:
+        print(f"[HTML警告] ファイルが大きすぎます ({size_mb:.0f}MB)。"
+              "画像埋め込みを無効にするか枚数を減らしてください")
+    return path, size_mb
+
+
+def render_docx(data, path):
+    """Write a .docx report. Requires python-docx; raises RuntimeError without it."""
+    try:
+        import docx
+        from docx.shared import Pt, Inches
+    except ImportError:
+        raise RuntimeError("python-docx が未導入です（pipenv install python-docx）")
+
+    folder = data["folder"]
+    doc = docx.Document()
+    doc.add_heading(f"会議記録 - {data['meeting_name'] or data['start_time_str']}", 0)
+
+    facts = meeting_facts(data)
+    table = doc.add_table(rows=0, cols=2)
+    table.style = "Light Grid Accent 1"
+    for label, value in facts:
+        cells = table.add_row().cells
+        cells[0].text = str(label)
+        cells[1].text = str(value)
+
+    summary = data.get("summary")
+    if summary:
+        doc.add_heading("サマリ", level=1)
+        if summary.get("summary"):
+            doc.add_paragraph(summary["summary"])
+        if summary.get("decisions"):
+            doc.add_heading("決定事項", level=2)
+            for d in summary["decisions"]:
+                doc.add_paragraph(d, style="List Bullet")
+        if summary.get("action_items"):
+            doc.add_heading("アクションアイテム", level=2)
+            at = doc.add_table(rows=1, cols=3)
+            at.style = "Light Grid Accent 1"
+            for i, head in enumerate(("タスク", "担当", "期限")):
+                at.rows[0].cells[i].text = head
+            for item in summary["action_items"]:
+                cells = at.add_row().cells
+                cells[0].text = item.get("task", "")
+                cells[1].text = item.get("owner") or "-"
+                cells[2].text = item.get("due") or "-"
+        if summary.get("open_issues"):
+            doc.add_heading("未決事項", level=2)
+            for q in summary["open_issues"]:
+                doc.add_paragraph(q, style="List Bullet")
+
+    doc.add_heading("記録", level=1)
+    for event in build_timeline(data):
+        ts = fmt_timestamp(event["t"])
+        item = event["data"]
+        if event["kind"] == "image":
+            tag = "自動" if item.get("type") == "auto" else "手動"
+            doc.add_paragraph(f"[{ts}] 画面キャプチャ ({tag})")
+            img_path = os.path.join(folder, item["file"])
+            if os.path.exists(img_path):
+                try:
+                    doc.add_picture(img_path, width=Inches(6.0))
+                except Exception as e:
+                    print(f"[DOCX警告] 画像を挿入できません {item['file']}: {e}")
+            if item.get("ocr"):
+                para = doc.add_paragraph(item["ocr"].strip())
+                para.runs[0].font.size = Pt(8)
+        elif event["kind"] == "marker":
+            para = doc.add_paragraph(f"⭐ [{ts}] {item.get('label') or '重要'}")
+            para.runs[0].bold = True
+        else:
+            who = f" {item['speaker']}:" if item.get("speaker") else ""
+            para = doc.add_paragraph()
+            run = para.add_run(f"[{ts}]{who} ")
+            run.bold = True
+            para.add_run(item["text"])
+
+    doc.save(path)
+    return path
+
+
 # ------------------------------------------------------------------ AI summary
 
 # The contract every provider must satisfy. Both back-ends are told to emit
@@ -2716,6 +3017,26 @@ def post_process_folder(folder, progress=None, cancel=None):
 
     md_path = os.path.join(folder, "meeting_report.md")
     render_markdown(data, md_path)
+
+    cfg = load_app_settings()
+    if cfg.get("export_html", True):
+        try:
+            html_path = os.path.join(folder, "meeting_report.html")
+            _, size_mb = render_html(
+                data, html_path,
+                embed_audio=bool(cfg.get("html_embed_audio", False)),
+                embed_images=bool(cfg.get("html_embed_images", True)))
+            report(0.98, f"HTML を出力しました ({size_mb:.1f}MB)")
+        except Exception as e:
+            report(None, f"[HTML出力エラー] {e}")
+            traceback.print_exc()
+    if cfg.get("export_docx", False):
+        try:
+            render_docx(data, os.path.join(folder, "meeting_report.docx"))
+            report(0.99, "DOCX を出力しました")
+        except Exception as e:
+            report(None, f"[DOCX出力エラー] {e}")
+
     report(1.0, f"議事録を出力しました: {os.path.basename(md_path)}")
     print(f"  - 発言 {len(data['lines'])}行 / 画像 {len(data['images'])}枚")
     return md_path
