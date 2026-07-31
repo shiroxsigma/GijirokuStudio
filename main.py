@@ -21,9 +21,10 @@ import imagehash
 import sounddevice as sd
 import pyaudiowpatch as pyaudio
 
-FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-GLOSSARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossary.csv")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe")
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+GLOSSARY_PATH = os.path.join(BASE_DIR, "glossary.csv")
 
 SUMMARY_PROVIDERS = [
     ("なし（要約しない）", "none"),
@@ -255,6 +256,7 @@ class MeetingRecorderGUI:
         self._marker_lock = threading.Lock()
         self._marker_count = 0
         self._hotkey = None
+        self._browser_win = None
 
         self._audio_devices = []        # list of enumerated device dicts
         self._audio_queues = []         # per-device capture queues (during recording)
@@ -353,6 +355,10 @@ class MeetingRecorderGUI:
         menu_settings.add_separator()
         menu_settings.add_command(label="設定をリセット", command=self._reset_settings)
         menubar.add_cascade(label="設定", menu=menu_settings)
+        menu_rec = tk.Menu(menubar, tearoff=0)
+        menu_rec.add_command(label="記録一覧を開く...",
+                             command=self._open_recordings_browser)
+        menubar.add_cascade(label="記録", menu=menu_rec)
         self.root.config(menu=menubar)
 
         frame_info = ttk.LabelFrame(self.root, text=" システム概要 ", padding=10)
@@ -795,6 +801,187 @@ class MeetingRecorderGUI:
         if not self.is_recording:
             self.label_status.config(text="ステータス: 停止中", foreground="#6b7280")
 
+    # ------------------------------------------------------ Recordings browser
+
+    def _scan_recordings(self):
+        """List recording folders under the app directory and the year folders.
+
+        Scanned lazily when the window opens, not at startup — a few hundred
+        meetings would otherwise slow every launch.
+        """
+        roots = [BASE_DIR]
+        try:
+            for name in os.listdir(BASE_DIR):
+                path = os.path.join(BASE_DIR, name)
+                if os.path.isdir(path) and re.fullmatch(r"\d{6,8}", name):
+                    roots.append(path)   # e.g. an IC-recorder import folder
+        except OSError as e:
+            print(f"[記録一覧警告] {e}")
+
+        seen = set()
+        rows = []
+        for root in roots:
+            try:
+                names = sorted(os.listdir(root), reverse=True)
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(root, name)
+                if path in seen or not os.path.isdir(path):
+                    continue
+                if not any(os.path.exists(os.path.join(path, a))
+                           for a in ("audio_main.mp3", "audio_main.wav")):
+                    continue
+                seen.add(path)
+                meta = _read_metadata(path)
+                images = sum(1 for f in os.listdir(path)
+                             if f.lower().endswith((".jpg", ".jpeg", ".png")))
+                rows.append({
+                    "path": path,
+                    "name": meta.get("MEETING_NAME") or name,
+                    "start": meta.get("START_TIME_STR", ""),
+                    "images": images,
+                    "markers": len(_read_jsonl(os.path.join(path, "markers.jsonl"))),
+                    "roles": bool(meta.get("ROLE_TRACKS")),
+                    "report": os.path.exists(os.path.join(path, "meeting_report.md")),
+                    "html": os.path.exists(os.path.join(path, "meeting_report.html")),
+                })
+        rows.sort(key=lambda r: (r["start"] or "", r["path"]), reverse=True)
+        return rows
+
+    def _open_recordings_browser(self):
+        if getattr(self, "_browser_win", None) is not None:
+            try:
+                self._browser_win.lift()
+                return
+            except tk.TclError:
+                pass
+
+        win = tk.Toplevel(self.root)
+        self._browser_win = win
+        win.title("GijirokuStudio - 記録一覧")
+        win.geometry("900x520")
+        win.transient(self.root)
+
+        top = ttk.Frame(win, padding=(10, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="検索:").pack(side="left")
+        var_q = tk.StringVar()
+        entry_q = ttk.Entry(top, width=30, textvariable=var_q)
+        entry_q.pack(side="left", padx=(6, 10))
+        var_full = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="議事録の本文も検索", variable=var_full).pack(side="left")
+        lbl_count = ttk.Label(top, text="", foreground="#6b7280")
+        lbl_count.pack(side="right")
+
+        cols = ("start", "name", "images", "markers", "roles", "report")
+        tree = ttk.Treeview(win, columns=cols, show="headings", selectmode="browse")
+        for col, text, width in (
+                ("start", "開始時刻", 150), ("name", "会議名", 300),
+                ("images", "画像", 60), ("markers", "⭐", 50),
+                ("roles", "話者分離", 80), ("report", "議事録", 150)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="w")
+        scroll = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=4)
+        scroll.pack(side="left", fill="y", padx=(0, 10), pady=4)
+
+        rows = []
+        by_item = {}
+
+        def _matches(row, query, full_text):
+            if not query:
+                return True
+            low = query.lower()
+            if low in row["name"].lower() or low in row["start"].lower():
+                return True
+            if not full_text:
+                return False
+            for fname in ("meeting_report.md", "transcription.txt"):
+                path = os.path.join(row["path"], fname)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        if low in f.read().lower():
+                            return True
+                except OSError:
+                    pass
+            return False
+
+        def _refill(*_):
+            query = var_q.get().strip()
+            tree.delete(*tree.get_children())
+            by_item.clear()
+            shown = 0
+            for row in rows:
+                if not _matches(row, query, var_full.get()):
+                    continue
+                report = ("md + html" if row["html"] else "md") if row["report"] else "未生成"
+                item = tree.insert("", "end", values=(
+                    row["start"] or "-", row["name"], row["images"],
+                    row["markers"] or "", "✓" if row["roles"] else "",
+                    report))
+                by_item[item] = row
+                shown += 1
+            lbl_count.config(text=f"{shown} / {len(rows)} 件")
+
+        def _reload():
+            rows.clear()
+            rows.extend(self._scan_recordings())
+            _refill()
+
+        def _selected():
+            sel = tree.selection()
+            return by_item.get(sel[0]) if sel else None
+
+        def _open_folder():
+            row = _selected()
+            if row:
+                os.startfile(row["path"])
+
+        def _open_report(kind):
+            row = _selected()
+            if not row:
+                return
+            path = os.path.join(row["path"], f"meeting_report.{kind}")
+            if os.path.exists(path):
+                os.startfile(path)
+            else:
+                messagebox.showinfo("未生成",
+                    f"meeting_report.{kind} がありません。先に後処理を実行してください。")
+
+        def _run_post():
+            row = _selected()
+            if not row:
+                return
+            win.destroy()
+            self._browser_win = None
+            self._run_postprocess(row["path"])
+
+        bar = ttk.Frame(win, padding=(10, 8))
+        bar.pack(side="bottom", fill="x")
+        for text, cmd in (("📄 議事録を生成/再生成", _run_post),
+                          ("📝 Markdown", lambda: _open_report("md")),
+                          ("🌐 HTML", lambda: _open_report("html")),
+                          ("📁 フォルダを開く", _open_folder),
+                          ("🔄 再スキャン", _reload)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+
+        # Trace the variable rather than <KeyRelease> so paste, clear, and
+        # programmatic edits all refresh the list.
+        var_q.trace_add("write", _refill)
+        var_full.trace_add("write", _refill)
+        tree.bind("<Double-1>", lambda _e: _run_post())
+
+        def _on_close():
+            self._browser_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        _reload()
+
     def _open_settings_dialog(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("GijirokuStudio - 設定")
@@ -1101,7 +1288,7 @@ class MeetingRecorderGUI:
         stamp = now.strftime("%Y%m%d_%H%M%S")
         safe = self._sanitize_name(self._meeting_name)
         suffix = safe if safe else "Meeting"
-        dir_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{stamp}_{suffix}")
+        dir_name = os.path.join(BASE_DIR, f"{stamp}_{suffix}")
         os.makedirs(dir_name, exist_ok=True)
         self._recording_dir = dir_name
         self.root.after(0, self._log, f"フォルダー作成: {dir_name}")
