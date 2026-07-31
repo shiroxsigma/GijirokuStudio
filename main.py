@@ -4,7 +4,6 @@ import sys
 import json
 import time
 import queue
-import ctypes
 import datetime
 import threading
 import subprocess
@@ -20,17 +19,51 @@ import pyaudiowpatch as pyaudio
 
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+GLOSSARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossary.csv")
 
-LANG_OPTIONS = [("日本語", "ja"), ("English", "en"), ("中文", "zh"), ("한국어", "ko")]
+LANG_OPTIONS = [
+    ("自動（日本語/英語）", "auto"),
+    ("日本語", "ja"), ("English", "en"), ("中文", "zh"), ("한국어", "ko"),
+]
 
 # Sentinel placed on a capture queue to signal end-of-stream to the mixer.
 _EOF = object()
 
 
+def _com_initialize():
+    """Initialise COM on the calling thread; True if we own the initialisation.
+
+    WASAPI is COM based and COM apartments are per thread. PortAudio only sets
+    COM up on the thread that first calls Pa_Initialize — later calls are
+    reference-counted no-ops — so a second capture thread inherits no apartment
+    and Pa_StartStream fails there with "Unanticipated host error" (-9999) even
+    though the device opened fine. Every capture thread initialises COM itself.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # APARTMENTTHREADED
+    except Exception as e:
+        print(f"[COM初期化警告] {e}")
+        return False
+    # S_OK / S_FALSE: this thread owns an initialisation and must balance it.
+    # RPC_E_CHANGED_MODE and other failures: leave the existing apartment alone.
+    return hr in (0, 1)
+
+
+def _com_uninitialize():
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoUninitialize()
+    except Exception as e:
+        print(f"[COM終了警告] {e}")
+
+
 class MeetingRecorderGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SlideSnap v2 - リモート会議記録システム")
+        self.root.title("GijirokuStudio v2 - リモート会議記録システム")
         self.root.geometry("620x860")
         self.root.resizable(False, False)
 
@@ -50,10 +83,15 @@ class MeetingRecorderGUI:
         self._last_record_dir = None
         self._queue_overflow_count = 0
         self._meeting_name = ""
+        self._rt_lang = None  # None = auto (ja/en detect), else fixed lang code
 
         self._audio_devices = []        # list of enumerated device dicts
         self._audio_queues = []         # per-device capture queues (during recording)
         self.transcribe_queue = None
+        # PortAudio init/open/terminate are not thread-safe: with several devices
+        # starting at once, unrelated opens fail with bogus "invalid sample rate".
+        self._open_lock = threading.Lock()
+        self._pcm_written = 0           # bytes handed to ffmpeg this recording
 
         self.INTERVAL = 5.0
         self.DHASH_THRESHOLD = 10
@@ -61,7 +99,17 @@ class MeetingRecorderGUI:
         self.AUDIO_GAIN = 2.0
         self.TARGET_RATE = 44100
         self.TRANSCRIBE_RATE = 16000
-        self.TRANSCRIBE_BUF_SECONDS = 1.0
+        self.TRANSCRIBE_CHUNK_SECONDS = 5.0   # real-time chunk length fed to faster-whisper
+        self.TRANSCRIBE_OVERLAP_SECONDS = 1.0  # trailing overlap kept across chunks
+        self.STARVE_SECONDS = 0.5   # a source silent this long stops blocking the mix
+
+        # faster-whisper (post-processing) settings — editable via settings.json
+        self.WHISPER_MODEL = "large-v3-turbo"
+        self.WHISPER_DEVICE = "cpu"
+        self.WHISPER_COMPUTE = "int8"
+
+        # faster-whisper (real-time) settings — smaller model for low latency
+        self.REALTIME_WHISPER_MODEL = "base"
 
         self._enumerate_audio_devices()
         self._load_settings()
@@ -79,17 +127,35 @@ class MeetingRecorderGUI:
                 self.DHASH_THRESHOLD = int(s.get("dhash_threshold", self.DHASH_THRESHOLD))
                 self.AUDIO_GAIN = float(s.get("audio_gain", self.AUDIO_GAIN))
                 self.JPEG_QUALITY = int(s.get("jpeg_quality", self.JPEG_QUALITY))
+                self.WHISPER_MODEL = str(s.get("whisper_model", self.WHISPER_MODEL))
+                self.WHISPER_DEVICE = str(s.get("whisper_device", self.WHISPER_DEVICE))
+                self.WHISPER_COMPUTE = str(s.get("whisper_compute", self.WHISPER_COMPUTE))
+                self.REALTIME_WHISPER_MODEL = str(s.get(
+                    "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
         except Exception as e:
             print(f"[設定読み込み警告] {e}")
 
     def _save_settings(self):
         try:
+            # read-modify-write so manually-added keys (incl. whisper_*) are preserved
+            existing = {}
+            if os.path.exists(SETTINGS_PATH):
+                try:
+                    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                except Exception:
+                    existing = {}
+            existing.update({
+                "dhash_threshold": self.DHASH_THRESHOLD,
+                "audio_gain": self.AUDIO_GAIN,
+                "jpeg_quality": self.JPEG_QUALITY,
+                "whisper_model": self.WHISPER_MODEL,
+                "whisper_device": self.WHISPER_DEVICE,
+                "whisper_compute": self.WHISPER_COMPUTE,
+                "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
+            })
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump({
-                    "dhash_threshold": self.DHASH_THRESHOLD,
-                    "audio_gain": self.AUDIO_GAIN,
-                    "jpeg_quality": self.JPEG_QUALITY,
-                }, f, indent=2, ensure_ascii=False)
+                json.dump(existing, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"[設定保存警告] {e}")
 
@@ -142,9 +208,14 @@ class MeetingRecorderGUI:
         ttk.Label(audio_frame,
             text="※ Ctrl/Shift+クリックで複数選択（スピーカー・マイク混在可）",
             font=("BIZ UDゴシック", 8), foreground="#6b7280").pack(anchor="w", pady=(2, 0))
-        self.btn_refresh_audio = ttk.Button(audio_frame, text="🔄 デバイス再検出",
+        audio_btn_row = ttk.Frame(audio_frame)
+        audio_btn_row.pack(anchor="w", pady=(4, 0))
+        self.btn_refresh_audio = ttk.Button(audio_btn_row, text="🔄 デバイス再検出",
             command=self._refresh_audio_devices)
-        self.btn_refresh_audio.pack(anchor="w", pady=(4, 0))
+        self.btn_refresh_audio.pack(side="left")
+        self.btn_select_all_audio = ttk.Button(audio_btn_row, text="🎚 すべて選択",
+            command=self._select_all_audio)
+        self.btn_select_all_audio.pack(side="left", padx=(6, 0))
 
         ttk.Label(frame_set, text="動作モード:").grid(row=3, column=0, sticky="w", pady=2)
         self.combo_mode = ttk.Combobox(frame_set, width=42, state="readonly",
@@ -216,10 +287,40 @@ class MeetingRecorderGUI:
 
     # --------------------------------------------------------- Audio device enumeration
 
+    # Host APIs that expose the same physical mic. Earlier = preferred.
+    _HOSTAPI_PRIORITY = ("Windows WASAPI", "Windows WDM-KS", "Windows DirectSound", "MME")
+    _HOSTAPI_SHORT = {
+        "Windows WASAPI": "WASAPI", "Windows WDM-KS": "WDM-KS",
+        "Windows DirectSound": "DSound", "MME": "MME",
+    }
+
+    # Virtual endpoints that just alias whatever the default input is. Listing
+    # them means "select all" captures the default mic two or three times over.
+    _VIRTUAL_INPUTS = (
+        "サウンド マッパー", "サウンドマッパー", "sound mapper",
+        "プライマリ サウンド キャプチャ", "primary sound capture",
+    )
+
+    @classmethod
+    def _is_virtual_input(cls, name):
+        low = name.lower()
+        return any(v in low for v in cls._VIRTUAL_INPUTS)
+
+    @staticmethod
+    def _dedupe_key(name):
+        """Normalized key matching one physical device across host APIs.
+        MME truncates names to 31 chars, so compare a short normalized prefix."""
+        return re.sub(r"[^0-9a-z぀-ヿ一-鿿]+", "", name.lower())[:30]
+
     def _enumerate_audio_devices(self):
         """Enumerate all capturable audio devices into a unified list.
-        Each entry: {key, kind, native_idx, name, channels, rate}
+        Each entry: {key, kind, native_idx, name, channels, rate, api}
           key: 'S<native_idx>' (speaker/loopback) / 'M<native_idx>' (mic)
+
+        Mics are deduplicated across host APIs (a single jack is otherwise listed
+        under MME / DirectSound / WASAPI / WDM-KS): selecting every entry would
+        open the same hardware several times — some opens fail, and the ones that
+        succeed get mixed into each other.
         """
         devices = []
         speaker_names = set()
@@ -238,6 +339,7 @@ class MeetingRecorderGUI:
                         "name": name,
                         "channels": int(lb["maxInputChannels"]),
                         "rate": int(lb["defaultSampleRate"]),
+                        "api": "WASAPI",
                     })
         except Exception as e:
             print(f"[デバイス列挙警告: speaker] {e}")
@@ -246,6 +348,13 @@ class MeetingRecorderGUI:
 
         # --- Mic/input via sounddevice ---
         try:
+            try:
+                hostapis = list(sd.query_hostapis())
+            except Exception:
+                hostapis = []
+            best = {}      # dedupe key -> (priority, entry)
+            order = []     # dedupe keys in first-seen order
+            skipped = 0
             for info in sd.query_devices():
                 if info.get("max_input_channels", 0) <= 0:
                     continue
@@ -254,14 +363,34 @@ class MeetingRecorderGUI:
                 # any input already listed on the speaker side (dedupe by name).
                 if "Loopback" in name or name in speaker_names:
                     continue
-                devices.append({
+                if self._is_virtual_input(name):
+                    continue
+                api_idx = info.get("hostapi", -1)
+                api_name = hostapis[api_idx]["name"] if 0 <= api_idx < len(hostapis) else ""
+                try:
+                    prio = self._HOSTAPI_PRIORITY.index(api_name)
+                except ValueError:
+                    prio = len(self._HOSTAPI_PRIORITY)
+                entry = {
                     "key": f"M{info['index']}",
                     "kind": "mic",
                     "native_idx": info["index"],
                     "name": name,
                     "channels": int(info["max_input_channels"]),
                     "rate": int(info["default_samplerate"]),
-                })
+                    "api": self._HOSTAPI_SHORT.get(api_name, api_name),
+                }
+                k = self._dedupe_key(name)
+                if k not in best:
+                    best[k] = (prio, entry)
+                    order.append(k)
+                else:
+                    skipped += 1
+                    if prio < best[k][0]:
+                        best[k] = (prio, entry)
+            devices.extend(best[k][1] for k in order)
+            if skipped:
+                print(f"[デバイス列挙] 別ホストAPIの重複マイク {skipped}件を非表示")
         except Exception as e:
             print(f"[デバイス列挙警告: mic] {e}")
 
@@ -274,7 +403,9 @@ class MeetingRecorderGUI:
         self.listbox_audio.delete(0, tk.END)
         for dev in self._audio_devices:
             prefix = "🔊 " if dev["kind"] == "speaker" else "🎤 "
-            self.listbox_audio.insert(tk.END, f"{prefix}{dev['name']}")
+            api = dev.get("api", "")
+            suffix = f"  [{api}]" if api and api != "WASAPI" else ""
+            self.listbox_audio.insert(tk.END, f"{prefix}{dev['name']}{suffix}")
         # Default selection: first speaker + first mic (mirrors prior "both on")
         first_speaker = first_mic = None
         for i, dev in enumerate(self._audio_devices):
@@ -294,6 +425,13 @@ class MeetingRecorderGUI:
         n_spk = sum(1 for d in self._audio_devices if d["kind"] == "speaker")
         n_mic = sum(1 for d in self._audio_devices if d["kind"] == "mic")
         self._log(f"オーディオデバイス再検出: スピーカー{n_spk} / マイク{n_mic}")
+
+    def _select_all_audio(self):
+        """Select every listed device. Dead/idle ones are tolerated at capture time."""
+        if self.is_recording:
+            return
+        self.listbox_audio.selection_set(0, tk.END)
+        self._log(f"音声デバイスを全選択: {self.listbox_audio.size()}件")
 
     def _selected_audio_devices(self):
         """Return list of device dicts currently selected in the Listbox."""
@@ -364,18 +502,16 @@ class MeetingRecorderGUI:
             self._preload_model()
 
     def _preload_model(self):
-        lang = LANG_OPTIONS[self.combo_lang.current()][1]
-
         def _load():
             try:
-                from moonshine_voice import Transcriber, get_model_for_language
-                label = LANG_OPTIONS[self.combo_lang.current()][0]
-                self.root.after(0, self._log, f"文字起こしモデルを事前読み込み中... ({label})")
-                model_path, model_arch = get_model_for_language(lang)
-                self._preloaded_transcriber = Transcriber(
-                    model_path=model_path, model_arch=model_arch,
-                    update_interval=0.3)
-                self.root.after(0, self._log, f"文字起こしモデル読み込み完了 ({label})")
+                from faster_whisper import WhisperModel
+                self.root.after(0, self._log,
+                    f"文字起こしモデルを事前読み込み中... ({self.REALTIME_WHISPER_MODEL})")
+                self._preloaded_transcriber = WhisperModel(
+                    self.REALTIME_WHISPER_MODEL,
+                    device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
+                self.root.after(0, self._log,
+                    f"文字起こしモデル読み込み完了 ({self.REALTIME_WHISPER_MODEL})")
             except Exception as e:
                 self.root.after(0, self._log, f"[事前読み込みエラー] {e}")
         threading.Thread(target=_load, daemon=True).start()
@@ -383,50 +519,16 @@ class MeetingRecorderGUI:
     def _on_lang_changed(self, _=None):
         label = LANG_OPTIONS[self.combo_lang.current()][0]
         lang = LANG_OPTIONS[self.combo_lang.current()][1]
+        # A single faster-whisper model handles ja/en/etc., so no model
+        # reload is needed on language change — just update the target lang.
+        self._rt_lang = None if lang == "auto" else lang
+        self._log(f"文字起こし言語設定: {label}")
 
-        if self.is_recording and self.transcriber is not None:
-            # Switch transcriber mid-recording
-            def _switch():
-                try:
-                    from moonshine_voice import Transcriber, get_model_for_language
-                    from moonshine_voice.transcriber import LineCompleted
-
-                    self.root.after(0, self._log, f"言語切替中... → {label}")
-
-                    # Stop current
-                    try:
-                        self.transcriber.stop()
-                        self.transcriber.close()
-                    except Exception:
-                        pass
-                    self.transcriber = None
-
-                    # Load new
-                    model_path, model_arch = get_model_for_language(lang)
-                    self.transcriber = Transcriber(
-                        model_path=model_path, model_arch=model_arch,
-                        update_interval=0.3)
-
-                    gui = self
-                    def _on_event(event):
-                        if isinstance(event, LineCompleted) and event.line.text.strip():
-                            text = event.line.text.strip()
-                            gui.root.after(0, gui._log_transcript, text)
-                            if gui.transcription_file:
-                                elapsed = time.time() - gui._transcribe_start
-                                gui.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
-                                gui.transcription_file.flush()
-                    self.transcriber.add_listener(_on_event)
-                    self.transcriber.start()
-                    self.root.after(0, self._log, f"言語切替完了 → {label}")
-                    self._write_language_event(lang, label)
-                except Exception as e:
-                    self.root.after(0, self._log, f"[言語切替エラー] {e}")
-            threading.Thread(target=_switch, daemon=True).start()
+        if self.is_recording:
+            self._write_language_event(lang, label)
         else:
-            # Pre-load for next recording
-            self._preloaded_transcriber = None
-            if self.combo_mode.current() == 1:
+            # Pre-load for next recording (no-op if already preloaded)
+            if self.combo_mode.current() == 1 and self._preloaded_transcriber is None:
                 self._preload_model()
 
     def _run_postprocess(self):
@@ -469,7 +571,7 @@ class MeetingRecorderGUI:
 
     def _open_settings_dialog(self):
         dlg = tk.Toplevel(self.root)
-        dlg.title("SlideSnap - 設定")
+        dlg.title("GijirokuStudio - 設定")
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
@@ -652,6 +754,8 @@ class MeetingRecorderGUI:
             self._meeting_name = self.entry_meeting.get().strip()
             self.is_recording = True
             self.stop_event.clear()
+            self._pcm_written = 0
+            self._queue_overflow_count = 0
             self._record_start = time.time()
             self._recording_mon_idx = self.combo_monitor.current()
             self.btn_toggle.config(text="■ 記録を停止して保存", bg="#ef4444")
@@ -660,6 +764,7 @@ class MeetingRecorderGUI:
                 w.config(state="disabled")
             self.listbox_audio.config(state="disabled")
             self.btn_refresh_audio.config(state="disabled")
+            self.btn_select_all_audio.config(state="disabled")
             self.entry_meeting.config(state="disabled")
             # combo_lang stays enabled for mid-recording language switching
             self._tick_elapsed_timer()
@@ -687,6 +792,7 @@ class MeetingRecorderGUI:
             w.config(state="readonly")
         self.listbox_audio.config(state="normal")
         self.btn_refresh_audio.config(state="normal")
+        self.btn_select_all_audio.config(state="normal")
         self.entry_meeting.config(state="normal")
 
     # ----------------------------------------------------------- Main pipeline
@@ -742,7 +848,7 @@ class MeetingRecorderGUI:
         else:
             mixer_t = threading.Thread(
                 target=self._mixer_loop_n,
-                args=(active, self._audio_queues), daemon=True)
+                args=(active, self._audio_queues, selected), daemon=True)
             mixer_t.start()
             writer_t = None
 
@@ -811,7 +917,7 @@ class MeetingRecorderGUI:
         for t in ctx['threads']:
             t.join(timeout=3)
         if ctx['mixer_t']:
-            ctx['mixer_t'].join(timeout=3)
+            ctx['mixer_t'].join(timeout=5)
         if ctx['writer_t']:
             ctx['writer_t'].join(timeout=3)
 
@@ -834,14 +940,24 @@ class MeetingRecorderGUI:
 
         elapsed = time.time() - ctx['start_epoch']
         m, s = divmod(int(elapsed), 60)
-        msg = f"記録完了 ({m:02d}:{s:02d})。画像: {ctx['snap_count']}枚 / 保存先: {dir_name}"
+        audio_sec = self._pcm_written / (self.TARGET_RATE * 4)   # stereo int16
+        msg = (f"記録完了 ({m:02d}:{s:02d})。画像: {ctx['snap_count']}枚 "
+               f"/ 音声: {audio_sec:.0f}秒 / 保存先: {dir_name}")
         if self._queue_overflow_count > 0:
             msg += f" / ⚠ キュー溢れ: {self._queue_overflow_count}回"
         self._pipeline_ctx = None
         self._last_record_dir = dir_name
         self.root.after(0, self._log, msg)
-        self.root.after(0, messagebox.showinfo, "完了",
-            f"すべての記録が正常に保存されました。\n\nフォルダー:\n{dir_name}")
+        if self._pcm_written == 0:
+            self.root.after(0, messagebox.showwarning, "音声なし",
+                "音声が1バイトも記録されませんでした。\n\n"
+                "選択したデバイスがすべて無音／使用不可の可能性があります。\n"
+                "動作ログの「[スキップ]」「無音（データ未着）」を確認してください。\n\n"
+                f"フォルダー:\n{dir_name}")
+        else:
+            self.root.after(0, messagebox.showinfo, "完了",
+                f"すべての記録が正常に保存されました。\n\n"
+                f"音声: 約{audio_sec:.0f}秒\n\nフォルダー:\n{dir_name}")
         self.root.after(0, self._reset_ui)
 
     # --------------------------------------------------- FFmpeg (Captura pattern)
@@ -864,6 +980,7 @@ class MeetingRecorderGUI:
         if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
             try:
                 self.ffmpeg_proc.stdin.write(pcm_bytes)
+                self._pcm_written += len(pcm_bytes)
             except (BrokenPipeError, OSError, ValueError):
                 pass
 
@@ -890,7 +1007,14 @@ class MeetingRecorderGUI:
     # ---------------------------------------------------- Audio normalization
 
     def _to_stereo_s16le(self, raw_bytes, channels, rate):
-        data = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+        channels = max(1, int(channels))
+        # Keep whole frames only: a short/odd tail would make reshape() raise
+        # inside the audio callback.
+        usable = len(raw_bytes) - (len(raw_bytes) % (2 * channels))
+        if usable <= 0:
+            return b""
+        data = np.frombuffer(raw_bytes, dtype=np.int16,
+                             count=usable // 2).astype(np.float32)
         if channels == 1:
             data = np.column_stack([data, data]).flatten()
         elif channels > 2:
@@ -935,23 +1059,42 @@ class MeetingRecorderGUI:
 
     # ------------------------------------------------- Mixer thread (N inputs)
 
-    def _mixer_loop_n(self, active, queues):
+    def _mixer_loop_n(self, active, queues, devices=None):
         """Mix N capture queues into one PCM stream.
 
         Each input queue may receive the _EOF sentinel to mark end-of-stream for
         that source. Sources that reach EOF contribute silence; mixing continues
         with the remaining live sources until every source is exhausted.
+
+        A source may also stop delivering without ever reaching EOF: Windows does
+        not run the audio engine for a loopback endpoint nothing is playing to,
+        so an idle speaker produces no callbacks at all. Such a source is treated
+        as silent after STARVE_SECONDS instead of blocking the whole mix.
         """
         N = len(queues)
         MIX_FRAMES = 1024
         FRAME_BYTES = 4                      # stereo int16 = 4 bytes
         MIX_BYTES = MIX_FRAMES * FRAME_BYTES  # 4096 bytes per output chunk
         OVERFLOW = MIX_BYTES * 50            # ~1.2 sec buffer limit
+        BUF_CAP = MIX_BYTES * 400            # ~9 sec hard cap, memory backstop
 
         bufs = [bytearray() for _ in range(N)]
         eof = [False] * N
+        t_start = time.time()
+        last_data = [t_start] * N
+        starved = [False] * N
+        stop_deadline = None
+        emitted = 0                 # bytes pushed downstream, for silence padding
+        SILENCE = bytes(MIX_BYTES)
+
+        def _name(i):
+            if devices and i < len(devices):
+                return devices[i]["name"]
+            return f"source{i}"
 
         def _emit(raw):
+            nonlocal emitted
+            emitted += len(raw)
             self._update_level(raw)
             self._ffmpeg_write(raw)
             self._push_transcribe(raw)
@@ -965,6 +1108,7 @@ class MeetingRecorderGUI:
                     eof[i] = True
                     return
                 bufs[i].extend(item)
+                last_data[i] = time.time()
 
         while not self.stop_event.is_set():
             live = [i for i in range(N) if not eof[i]]
@@ -976,15 +1120,29 @@ class MeetingRecorderGUI:
                 if len(bufs[i]) != before or eof[i]:
                     got = True
 
-            # Mix aligned chunks while every live source has enough data
-            while live and all(len(bufs[i]) >= MIX_BYTES for i in live):
+            now = time.time()
+            for i in live:
+                quiet = now - last_data[i] >= self.STARVE_SECONDS
+                if quiet != starved[i]:
+                    starved[i] = quiet
+                    state = "無音（データ未着）" if quiet else "受信再開"
+                    self.root.after(0, self._log, f"[音声] {_name(i)}: {state}")
+
+            # Mix aligned chunks. Sources that are live but have gone quiet do not
+            # hold the mix back — they simply contribute nothing to these chunks.
+            while True:
+                ready = [i for i in live if len(bufs[i]) >= MIX_BYTES]
+                blocking = [i for i in live
+                            if len(bufs[i]) < MIX_BYTES and not starved[i]]
+                if not ready or blocking:
+                    break
                 acc = np.zeros(MIX_BYTES // 2, dtype=np.float32)
-                for i in live:
+                for i in ready:
                     chunk = np.frombuffer(bytes(bufs[i][:MIX_BYTES]),
                         dtype=np.int16).astype(np.float32)
                     acc += chunk
                     del bufs[i][:MIX_BYTES]
-                acc *= (1.0 / len(live))     # average-mix: amplitude stays ≤1.0 as sources grow
+                acc *= (1.0 / len(ready))    # average-mix: amplitude stays ≤1.0 as sources grow
                 np.clip(acc, -32768, 32767, out=acc)
                 _emit(acc.astype(np.int16).tobytes())
 
@@ -998,9 +1156,36 @@ class MeetingRecorderGUI:
                         _emit(bytes(bufs[i][:MIX_BYTES]))
                         del bufs[i][:MIX_BYTES]
 
-            # Termination: stop requested and every source reached EOF
-            if not active.is_set() and all(eof[i] for i in range(N)):
-                break
+            # Keep the timeline honest. With only idle loopback devices selected
+            # nothing arrives at all, and the MP3 would end up shorter than the
+            # meeting — transcript timestamps would no longer line up with the
+            # snapshots. Pad the gap with real silence, but only while every live
+            # source is starved, so normal mixing is never second-guessed.
+            if live and all(starved[i] for i in live) and not self.stop_event.is_set():
+                deficit = int((now - t_start) * self.TARGET_RATE * FRAME_BYTES) - emitted
+                while deficit >= MIX_BYTES:
+                    _emit(SILENCE)
+                    deficit -= MIX_BYTES
+
+            # Memory backstop: never let a stalled mix grow without bound
+            for i in range(N):
+                if len(bufs[i]) > BUF_CAP:
+                    drop = len(bufs[i]) - BUF_CAP
+                    drop -= drop % FRAME_BYTES
+                    del bufs[i][:drop]
+                    self._queue_overflow_count += 1
+
+            # Termination: stop requested and every source reached EOF. A capture
+            # thread wedged in the driver must not hold the file open forever.
+            if not active.is_set():
+                if all(eof[i] for i in range(N)):
+                    break
+                if stop_deadline is None:
+                    stop_deadline = now + 3.0
+                elif now > stop_deadline:
+                    self.root.after(0, self._log,
+                        "[音声] 応答しないデバイスを待たずにミキシングを終了")
+                    break
 
             if not got:
                 time.sleep(0.01)
@@ -1024,6 +1209,7 @@ class MeetingRecorderGUI:
 
     def _capture_device(self, active, dev, out_queue):
         """Capture one device; normalize PCM into out_queue. Emits _EOF on exit."""
+        own_com = _com_initialize()
         try:
             if dev["kind"] == "speaker":
                 self._capture_speaker_dev(active, dev, out_queue)
@@ -1032,6 +1218,8 @@ class MeetingRecorderGUI:
         except Exception as e:
             self.root.after(0, self._log, f"[キャプチャエラー] {dev['name']}: {e}")
         finally:
+            if own_com:
+                _com_uninitialize()   # after the stream is closed, never before
             # Guarantee the EOF sentinel lands so the mixer can drain & terminate.
             for _ in range(3):
                 try:
@@ -1045,85 +1233,168 @@ class MeetingRecorderGUI:
 
     # ----------------------------------------- Speaker capture (pyaudiowpatch)
 
-    def _capture_speaker_dev(self, active, dev, out_queue):
-        p = pyaudio.PyAudio()
-        try:
-            ch, sr = dev["channels"], dev["rate"]
-            self.root.after(0, self._log,
-                f"スピーカーキャプチャ開始: {dev['name']} ({sr}Hz, {ch}ch, idx={dev['native_idx']})")
+    @staticmethod
+    def _format_candidates(channels, rate):
+        """(channels, rate) combos to try, best first. A device's advertised
+        default is not always openable — multi-channel endpoints in particular."""
+        combos = []
+        for c in (channels, 2, 1):
+            c = int(c)
+            if c < 1:
+                continue
+            for r in (rate, 48000, 44100):
+                r = int(r)
+                if (c, r) not in combos:
+                    combos.append((c, r))
+        return combos
 
+    def _capture_speaker_dev(self, active, dev, out_queue):
+        def _make_callback(ch, sr):
             def _callback(in_data, frame_count, time_info, status):
-                pcm = self._to_stereo_s16le(in_data, ch, sr)
+                # An exception raised here propagates into PortAudio's C callback
+                # and can take the process down — never let one escape.
                 try:
-                    out_queue.put_nowait(pcm)
+                    pcm = self._to_stereo_s16le(in_data, ch, sr)
+                    if pcm:
+                        out_queue.put_nowait(pcm)
                 except queue.Full:
                     pass
+                except Exception:
+                    pass
                 return (None, pyaudio.paContinue)
+            return _callback
 
-            stream = p.open(
-                format=pyaudio.paInt16, channels=ch, rate=sr,
-                input=True, input_device_index=dev["native_idx"],
-                frames_per_buffer=1024, stream_callback=_callback)
-            stream.start_stream()
+        stream = None
+        open_err = None   # first failure = the device's own advertised format
+        # PortAudio must be initialised on the very thread that opens the stream:
+        # its WASAPI backend sets up COM per thread, so a handle created on
+        # another thread makes every open fail with "invalid sample rate".
+        with self._open_lock:
+            p = pyaudio.PyAudio()
+            for ch, sr in self._format_candidates(dev["channels"], dev["rate"]):
+                try:
+                    stream = p.open(
+                        format=pyaudio.paInt16, channels=ch, rate=sr,
+                        input=True, input_device_index=dev["native_idx"],
+                        frames_per_buffer=1024, start=False,
+                        stream_callback=_make_callback(ch, sr))
+                    stream.start_stream()
+                    self.root.after(0, self._log,
+                        f"スピーカーキャプチャ開始: {dev['name']} "
+                        f"({sr}Hz, {ch}ch, idx={dev['native_idx']})")
+                    break
+                except Exception as e:
+                    if open_err is None:
+                        open_err = e
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+
+        def _terminate():
+            with self._open_lock:
+                try:
+                    p.terminate()
+                except Exception as e:
+                    print(f"[PyAudio終了警告] {dev['name']}: {e}")
+
+        if stream is None:
+            # Device unusable (disabled, exclusive-mode, unsupported format) —
+            # report it and let the rest of the selection keep recording.
+            _terminate()
+            self.root.after(0, self._log,
+                f"[スキップ] スピーカー {dev['name']}: 開けません ({open_err})")
+            return
+
+        try:
             while active.is_set() and self.is_recording:
                 time.sleep(0.5)
-            stream.stop_stream()
-            stream.close()
         finally:
-            p.terminate()
+            try:
+                stream.stop_stream()
+            except Exception as e:
+                print(f"[停止警告] {dev['name']}: {e}")
+            try:
+                stream.close()
+            except Exception as e:
+                print(f"[クローズ警告] {dev['name']}: {e}")
+            _terminate()
 
     # ------------------------------------------- Mic capture (sounddevice)
 
     def _capture_mic_dev(self, active, dev, out_queue):
-        ch = min(dev["channels"], 2)
-        sr = dev["rate"]
-        self.root.after(0, self._log, f"マイクキャプチャ開始: {dev['name']} ({sr}Hz)")
+        def _make_callback(ch, sr):
+            def _callback(in_data, frames, time_info, status):
+                try:
+                    pcm = self._to_stereo_s16le(in_data.tobytes(), ch, sr)
+                    if pcm:
+                        out_queue.put_nowait(pcm)
+                except queue.Full:
+                    pass
+                except Exception:
+                    pass
+            return _callback
 
-        def _callback(in_data, frames, time_info, status):
-            pcm = self._to_stereo_s16le(in_data.tobytes(), ch, sr)
-            try:
-                out_queue.put_nowait(pcm)
-            except queue.Full:
-                pass
+        stream = None
+        open_err = None   # first failure = the device's own advertised format
+        with self._open_lock:
+            for ch, sr in self._format_candidates(min(dev["channels"], 2), dev["rate"]):
+                try:
+                    stream = sd.InputStream(
+                        device=dev["native_idx"], channels=ch, samplerate=sr,
+                        dtype='int16', blocksize=1024, callback=_make_callback(ch, sr))
+                    stream.start()
+                    self.root.after(0, self._log,
+                        f"マイクキャプチャ開始: {dev['name']} ({sr}Hz, {ch}ch)")
+                    break
+                except Exception as e:
+                    if open_err is None:
+                        open_err = e
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
 
-        with sd.InputStream(device=dev["native_idx"], channels=ch,
-                            samplerate=sr, dtype='int16',
-                            blocksize=1024, callback=_callback):
+        if stream is None:
+            self.root.after(0, self._log,
+                f"[スキップ] マイク {dev['name']}: 開けません ({open_err})")
+            return
+
+        try:
             while active.is_set() and self.is_recording:
                 time.sleep(0.5)
+        finally:
+            try:
+                stream.stop()
+            except Exception as e:
+                print(f"[停止警告] {dev['name']}: {e}")
+            try:
+                stream.close()
+            except Exception as e:
+                print(f"[クローズ警告] {dev['name']}: {e}")
 
-    # ------------------------------------------ Transcription (moonshine-voice)
+    # ------------------------------------------ Transcription (faster-whisper)
 
     def _transcription_start(self, dir_name):
         try:
-            from moonshine_voice.transcriber import LineCompleted
-
             if self._preloaded_transcriber is not None:
                 self.transcriber = self._preloaded_transcriber
                 self._preloaded_transcriber = None
                 self.root.after(0, self._log, "事前読み込み済みモデルを使用")
             else:
-                from moonshine_voice import Transcriber, get_model_for_language
-                lang = LANG_OPTIONS[self.combo_lang.current()][1]
-                label = LANG_OPTIONS[self.combo_lang.current()][0]
-                self.root.after(0, self._log, f"文字起こしモデルを読み込み中... ({label})")
-                model_path, model_arch = get_model_for_language(lang)
-                self.transcriber = Transcriber(
-                    model_path=model_path, model_arch=model_arch,
-                    update_interval=0.3)
+                from faster_whisper import WhisperModel
+                self.root.after(0, self._log,
+                    f"文字起こしモデルを読み込み中... ({self.REALTIME_WHISPER_MODEL})")
+                self.transcriber = WhisperModel(
+                    self.REALTIME_WHISPER_MODEL,
+                    device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
 
-            gui = self
-            def _on_event(event):
-                if isinstance(event, LineCompleted) and event.line.text.strip():
-                    text = event.line.text.strip()
-                    gui.root.after(0, gui._log_transcript, text)
-                    if gui.transcription_file:
-                        elapsed = time.time() - gui._transcribe_start
-                        gui.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
-                        gui.transcription_file.flush()
-
-            self.transcriber.add_listener(_on_event)
-            self.transcriber.start()
+            lang = LANG_OPTIONS[self.combo_lang.current()][1]
+            self._rt_lang = None if lang == "auto" else lang
 
             self.transcription_file = open(
                 os.path.join(dir_name, "transcription.txt"), "w", encoding="utf-8")
@@ -1136,53 +1407,97 @@ class MeetingRecorderGUI:
             self.transcriber = None
 
     def _transcribe_loop(self):
-        buf_size = int(self.TARGET_RATE * 2 * self.TRANSCRIBE_BUF_SECONDS)
-        buf = np.zeros(buf_size, dtype=np.float32)
-        buf_pos = 0
+        """Chunk-driven real-time transcription loop.
+
+        Incoming PCM (44100Hz stereo int16, from self.transcribe_queue) is
+        down-mixed to mono and resampled to 16000Hz. Once ~5 seconds of audio
+        has accumulated, faster-whisper transcribes the chunk (auto-detecting
+        ja/en when self._rt_lang is None). ~1 second of trailing audio is kept
+        as overlap so words aren't cut at chunk boundaries.
+        """
+        from scipy.signal import resample as _resample
+
+        chunk_samples = int(self.TRANSCRIBE_RATE * self.TRANSCRIBE_CHUNK_SECONDS)
+        overlap_samples = int(self.TRANSCRIBE_RATE * self.TRANSCRIBE_OVERLAP_SECONDS)
+        min_flush_samples = int(self.TRANSCRIBE_RATE * 0.5)
+
+        buf = np.zeros(0, dtype=np.float32)
+        last_lang = None
+
+        def _drop_backlog():
+            # Backpressure: if the queue is backing up, drop the oldest
+            # chunks so transcription keeps pace with real time.
+            q = self.transcribe_queue
+            if q is None:
+                return
+            qsize = q.qsize()
+            if qsize > 200:
+                for _ in range(qsize - 50):
+                    try:
+                        q.get_nowait()
+                        self._queue_overflow_count += 1
+                    except queue.Empty:
+                        break
 
         while self.is_recording and not self.stop_event.is_set():
             if self.transcribe_queue is None or self.transcriber is None:
                 time.sleep(0.1)
                 continue
+
+            _drop_backlog()
+
             try:
                 pcm = self.transcribe_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+
             try:
                 samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
-                n = min(len(mono), buf_size - buf_pos)
-                buf[buf_pos:buf_pos + n] = mono[:n]
-                buf_pos += n
-                if buf_pos >= buf_size:
-                    self._feed_transcriber(buf[:buf_pos])
-                    buf_pos = 0
+                mono_44k = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
+                n_out = int(len(mono_44k) * self.TRANSCRIBE_RATE / self.TARGET_RATE)
+                if n_out > 0:
+                    mono_16k = _resample(mono_44k, n_out).astype(np.float32)
+                    buf = np.concatenate([buf, mono_16k])
+
+                while len(buf) >= chunk_samples:
+                    clip = buf[:chunk_samples]
+                    last_lang = self._transcribe_chunk(clip, last_lang)
+                    buf = buf[max(0, chunk_samples - overlap_samples):]
             except Exception as e:
                 self.root.after(0, self._log, f"[文字起こし処理エラー] {e}")
 
-        if buf_pos > 0 and self.transcriber is not None:
+        if len(buf) >= min_flush_samples and self.transcriber is not None:
             try:
-                self._feed_transcriber(buf[:buf_pos])
+                self._transcribe_chunk(buf, last_lang)
             except Exception as e:
                 self.root.after(0, self._log, f"[バッファフラッシュ警告] {e}")
 
-    def _feed_transcriber(self, mono_float32):
-        n_out = int(len(mono_float32) * self.TRANSCRIBE_RATE / self.TARGET_RATE)
-        if n_out <= 0:
-            return
-        from scipy.signal import resample as _resample
-        resampled = _resample(mono_float32, n_out)
-        c_arr = (ctypes.c_float * len(resampled))(*resampled)
-        self.transcriber.add_audio(c_arr, self.TRANSCRIBE_RATE)
+    def _transcribe_chunk(self, clip, prev_lang):
+        """Transcribe one ~5s 16kHz mono chunk; return the language used."""
+        try:
+            lang = detect_ja_en(self.transcriber, clip) if self._rt_lang is None else self._rt_lang
+            segments, info = self.transcriber.transcribe(
+                clip, language=lang, vad_filter=True, beam_size=1)
+            for seg in segments:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                self.root.after(0, self._log_transcript, text)
+                if self.transcription_file:
+                    elapsed = time.time() - self._transcribe_start
+                    self.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
+                    self.transcription_file.flush()
+            if self._rt_lang is None and lang != prev_lang:
+                label = "日本語" if lang == "ja" else "English"
+                self._write_language_event(lang, label)
+            return lang
+        except Exception as e:
+            self.root.after(0, self._log, f"[文字起こし処理エラー] {e}")
+            return prev_lang
 
     def _transcription_stop(self):
-        if self.transcriber:
-            try:
-                self.transcriber.stop()
-                self.transcriber.close()
-            except Exception as e:
-                print(f"[文字起こし停止警告] {e}")
-            self.transcriber = None
+        # WhisperModel needs no explicit close/stop — just drop the reference.
+        self.transcriber = None
         if self.transcription_file:
             self.transcription_file.close()
             self.transcription_file = None
@@ -1194,9 +1509,155 @@ class MeetingRecorderGUI:
 # CLI: Post-processing — whisper transcription + markdown generation
 # ======================================================================
 
+def load_app_settings():
+    """Read settings.json into a dict ({} if absent/invalid). Shared by GUI & CLI."""
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except Exception as e:
+        print(f"[設定読み込み警告] {e}")
+        return {}
+
+
+def load_glossary():
+    """Load the term glossary CSV. Each row: form, reading, alias1, alias2, ...
+    Returns list of {form, reading, aliases}. Empty list if the file is absent.
+    Blank lines and '#'-prefixed lines are skipped.
+    """
+    if not os.path.exists(GLOSSARY_PATH):
+        return []
+    import csv
+    terms = []
+    try:
+        with open(GLOSSARY_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.reader(f):
+                row = [c.strip() for c in row]
+                if not row or not row[0] or row[0].startswith("#"):
+                    continue
+                if row[0].lower() in ("正規形", "form", "用語", "term", "word", "name"):
+                    continue  # header row
+                form = row[0]
+                reading = row[1] if len(row) > 1 else ""
+                aliases = [a for a in row[2:] if a]
+                terms.append({"form": form, "reading": reading, "aliases": aliases})
+    except Exception as e:
+        print(f"[用語辞書読み込み警告] {e}")
+    return terms
+
+
+def build_whisper_prompt(terms):
+    """Build a Whisper initial_prompt (vocabulary bias) from canonical forms.
+    Caps at ~80 terms / 400 chars to stay within the prompt token budget.
+    Returns None when there is nothing to bias with.
+    """
+    forms = [t["form"] for t in terms if t.get("form")]
+    if not forms:
+        return None
+    return "、".join(forms[:80])[:400]
+
+
+def detect_ja_en(model, audio_f32):
+    """Detect whether a 16kHz mono float32 clip is Japanese or English.
+
+    Uses faster-whisper's model.detect_language(), restricted to just the
+    ja/en pair. Falls back to a transcribe()-based detection (reading
+    info.language, coercing anything that isn't 'en' to 'ja') for older
+    faster-whisper versions that lack detect_language(). Defaults to 'ja'
+    if detection fails entirely.
+    """
+    try:
+        _, _, all_language_probs = model.detect_language(audio_f32)
+        probs = dict(all_language_probs)
+        ja_p = probs.get("ja", 0.0)
+        en_p = probs.get("en", 0.0)
+        return "en" if en_p > ja_p else "ja"
+    except Exception:
+        pass
+    try:
+        _, info = model.transcribe(audio_f32, language=None)
+        return "en" if getattr(info, "language", "ja") == "en" else "ja"
+    except Exception:
+        return "ja"
+
+
+def iter_speech_windows(audio_f32, sr, window_s=25.0):
+    """Yield (start_sample, end_sample) windows covering speech in audio_f32.
+
+    Uses faster-whisper's bundled Silero VAD (get_speech_timestamps) to find
+    speech spans, then greedily groups consecutive spans into windows up to
+    ~window_s seconds each. On any failure, or if no speech is detected,
+    falls back to fixed contiguous windows of window_s seconds spanning the
+    whole array. Windows shorter than ~0.5s are never yielded.
+    """
+    min_samples = int(0.5 * sr)
+    window_samples = int(window_s * sr)
+    total = len(audio_f32)
+
+    def _fixed_windows():
+        start = 0
+        while start < total:
+            end = min(start + window_samples, total)
+            if end - start >= min_samples:
+                yield (start, end)
+            start = end
+
+    try:
+        from faster_whisper.vad import get_speech_timestamps
+        spans = get_speech_timestamps(audio_f32)
+        if not spans:
+            yield from _fixed_windows()
+            return
+
+        cur_start = spans[0]["start"]
+        cur_end = spans[0]["end"]
+        for sp in spans[1:]:
+            if sp["end"] - cur_start <= window_samples:
+                cur_end = sp["end"]
+            else:
+                if cur_end - cur_start >= min_samples:
+                    yield (cur_start, cur_end)
+                cur_start = sp["start"]
+                cur_end = sp["end"]
+        if cur_end - cur_start >= min_samples:
+            yield (cur_start, cur_end)
+    except Exception:
+        yield from _fixed_windows()
+
+
+def apply_glossary(lines, terms):
+    """Exact longest-match replacement of registered aliases -> canonical form.
+    Correctly-recognised canonical forms are left untouched. Mutates `lines`
+    in place; returns the number of lines that were changed.
+    """
+    repl = {}
+    for t in terms:
+        form = t.get("form")
+        if not form:
+            continue
+        for pat in t.get("aliases", []):
+            if pat and pat != form:
+                repl[pat] = form
+    if not repl:
+        return 0
+    patterns = sorted(repl.keys(), key=len, reverse=True)  # longest first
+    changed = 0
+    for ln in lines:
+        text = ln.get("text", "")
+        for pat in patterns:
+            if pat in text:
+                text = text.replace(pat, repl[pat])
+        if text != ln.get("text", ""):
+            ln["text"] = text
+            changed += 1
+    return changed
+
+
 def post_process_folder(folder):
     """Transcribe audio in a meeting folder and generate combined markdown."""
-    print(f"SlideSnap Post-Processor")
+    print(f"GijirokuStudio Post-Processor")
     print(f"Folder: {folder}")
     print()
 
@@ -1225,8 +1686,9 @@ def post_process_folder(folder):
                     meta[k] = v
     start_time_str = meta.get("START_TIME_STR", "Unknown")
     default_lang = meta.get("LANGUAGE", "ja")
+    auto_mode = default_lang == "auto"
     meeting_name = meta.get("MEETING_NAME", "")
-    print(f"Language: {default_lang}")
+    print(f"Language: {'auto (ja/en)' if auto_mode else default_lang}")
 
     # Read language segments
     lang_segments = []
@@ -1298,56 +1760,98 @@ def post_process_folder(folder):
     duration = len(audio) / sr
     print(f"Audio duration: {duration:.1f}s ({sr}Hz)")
 
-    # Transcribe — segment by language if segments exist, else single pass
-    print("Transcribing with moonshine-voice...")
-    from moonshine_voice import Transcriber, get_model_for_language
+    # Transcribe — segment by language if segments exist, else single pass.
+    terms = load_glossary()
+    prompt = build_whisper_prompt(terms)
+    print(f"Glossary terms: {len(terms)}")
 
     lines = []
 
-    if lang_segments:
-        # Build segment boundaries: [(start_sec, end_sec, lang), ...]
-        segments = []
-        for seg in lang_segments:
-            start = seg["elapsed"]
-            lang = seg["lang"]
-            segments.append({"start": start, "lang": lang})
-        # Sort by start time
-        segments.sort(key=lambda x: x["start"])
+    # Choose engine: faster-whisper when available (vocabulary-biased, VAD),
+    # otherwise fall back to the original moonshine-voice path.
+    using_faster_whisper = False
+    model = None
+    try:
+        from faster_whisper import WhisperModel
+        cfg = load_app_settings()
+        w_model = cfg.get("whisper_model", "large-v3-turbo")
+        w_device = cfg.get("whisper_device", "cpu")
+        w_compute = cfg.get("whisper_compute", "int8")
+        print(f"Transcribing with faster-whisper ({w_model} / {w_device})...")
+        model = WhisperModel(w_model, device=w_device, compute_type=w_compute)
+        using_faster_whisper = True
 
-        for i, seg in enumerate(segments):
-            start_s = seg["start"]
-            end_s = segments[i + 1]["start"] if i + 1 < len(segments) else duration
-            lang = seg["lang"]
-            label = seg.get("label", lang)
+        def _transcribe(clip_audio, lang, offset):
+            segs, info = model.transcribe(
+                clip_audio, language=lang, initial_prompt=prompt,
+                vad_filter=True, beam_size=5)
+            for s in segs:
+                txt = s.text.strip()
+                if txt:
+                    lines.append({"text": txt, "start": offset + (s.start or 0.0)})
+    except ImportError:
+        print("faster-whisper 未インストール → moonshine-voice でフォールバック")
+        from moonshine_voice import Transcriber, get_model_for_language
+
+        def _transcribe(clip_audio, lang, offset):
+            if lang == "auto":
+                lang = "ja"  # moonshine can't auto-detect language
+            model_path, model_arch = get_model_for_language(lang)
+            transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
+            transcript = transcriber.transcribe_without_streaming(clip_audio.tolist(), sr)
+            transcriber.close()
+            for line in transcript.lines:
+                if line.text.strip():
+                    abs_start = offset + (line.start_time if line.start_time else 0.0)
+                    lines.append({"text": line.text.strip(), "start": abs_start})
+
+    detected_langs = set()
+
+    if auto_mode:
+        # Auto JA/EN: ignore any recorded lang_segments and instead detect
+        # the language independently for each VAD-grouped speech window.
+        print("Auto language mode: detecting ja/en per speech window")
+        for start_sample, end_sample in iter_speech_windows(audio, sr):
+            seg_audio = audio[start_sample:end_sample]
+            start_s = start_sample / sr
+            end_s = end_sample / sr
+            if len(seg_audio) < sr * 0.5:  # skip very short windows
+                continue
+            lang = detect_ja_en(model, seg_audio) if using_faster_whisper else "ja"
+            detected_langs.add(lang)
+            print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] auto -> {lang}...")
+            _transcribe(seg_audio, lang, start_s)
+    else:
+        # Build clip list: [(start_s, end_s, lang, label), ...]
+        if lang_segments:
+            segments = sorted(
+                ({"start": seg["elapsed"], "lang": seg["lang"],
+                  "label": seg.get("label", seg["lang"])} for seg in lang_segments),
+                key=lambda x: x["start"])
+            clips = []
+            for i, seg in enumerate(segments):
+                end_s = segments[i + 1]["start"] if i + 1 < len(segments) else duration
+                clips.append((seg["start"], end_s, seg["lang"], seg["label"]))
+        else:
+            clips = [(0.0, duration, default_lang, default_lang)]
+
+        for start_s, end_s, lang, label in clips:
             start_sample = int(start_s * sr)
             end_sample = min(int(end_s * sr), len(audio))
             seg_audio = audio[start_sample:end_sample]
-
             if len(seg_audio) < sr * 0.5:  # skip very short segments
                 print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] {label}: skipped (< 0.5s)")
                 continue
-
             print(f"  Segment [{start_s:.1f}s - {end_s:.1f}s] {label}...")
-            model_path, model_arch = get_model_for_language(lang)
-            transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
-            transcript = transcriber.transcribe_without_streaming(seg_audio.tolist(), sr)
-            transcriber.close()
+            _transcribe(seg_audio, lang, start_s)
 
-            for line in transcript.lines:
-                if line.text.strip():
-                    abs_start = start_s + (line.start_time if line.start_time else 0.0)
-                    lines.append({"text": line.text.strip(), "start": abs_start})
-    else:
-        # Single-pass transcription (backward compatible)
-        model_path, model_arch = get_model_for_language(default_lang)
-        transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
-        transcript = transcriber.transcribe_without_streaming(audio.tolist(), sr)
-        transcriber.close()
+    if auto_mode:
+        print(f"Detected languages: {', '.join(sorted(detected_langs)) if detected_langs else '-'}")
 
-        for line in transcript.lines:
-            if line.text.strip():
-                start_s = line.start_time if line.start_time else 0.0
-                lines.append({"text": line.text.strip(), "start": start_s})
+    # Post-hoc glossary correction (alias -> canonical form)
+    corrected = apply_glossary(lines, terms)
+    if corrected:
+        print(f"Glossary corrections applied: {corrected} lines")
 
     lines.sort(key=lambda x: x["start"])
     print(f"Transcription lines: {len(lines)}")
@@ -1364,8 +1868,12 @@ def post_process_folder(folder):
         f.write(f"| 録音時間 | {duration:.0f}s ({duration/60:.1f}min) |\n")
         f.write(f"| 画像数 | {len(img_entries)} |\n")
         f.write(f"| 音声ソース | {meta.get('AUDIO_SOURCE', '-')} |\n")
-        f.write(f"| 言語 | {default_lang} |\n")
-        if lang_segments:
+        if auto_mode:
+            detected_str = "/".join(sorted(detected_langs)) if detected_langs else "-"
+            f.write(f"| 言語 | 自動 (ja/en) — 検出: {detected_str} |\n")
+        else:
+            f.write(f"| 言語 | {default_lang} |\n")
+        if lang_segments and not auto_mode:
             lang_summary = ", ".join(
                 f"{s.get('label', s['lang'])} ({s['start']:.0f}s〜)" for s in lang_segments)
             f.write(f"| 言語切替 | {lang_summary} |\n")
@@ -1393,22 +1901,18 @@ def post_process_folder(folder):
                 li += 1
 
         f.write("---\n\n")
-        f.write("*Generated by SlideSnap v2*\n")
+        f.write("*Generated by GijirokuStudio v2*\n")
 
     print(f"\nDone! Markdown saved to: {md_path}")
     print(f"  - {len(lines)} transcription lines")
     print(f"  - {len(img_entries)} images")
-
-    print(f"\nDone! Markdown saved to: {md_path}")
-    print(f"  - {len(lines)} transcription lines")
-    print(f"  - {len(images)} images")
 
 
 # ======================================================================
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="SlideSnap v2")
+    parser = argparse.ArgumentParser(description="GijirokuStudio v2")
     parser.add_argument("--post-process", metavar="FOLDER",
         help="指定フォルダの音声を高精度文字起こしし、スクリーンショットと統合したMarkdownを出力")
     args = parser.parse_args()
