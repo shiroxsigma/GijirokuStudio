@@ -1448,10 +1448,12 @@ class MeetingRecorderGUI:
                     "epoch": round(epoch, 3),
                     "elapsed": round(elapsed, 3),
                     "type": snap_type,
-                    "diff": diff,
+                    "diff": int(diff) if diff is not None else None,
                 }, ensure_ascii=False) + "\n")
         except Exception as e:
-            print(f"[snapshot log書き込み警告] {e}")
+            # A dropped line means the image never reaches the report, so this
+            # has to be visible in the app — a console print is not.
+            self.root.after(0, self._log, f"[スナップショット記録エラー] {fname}: {e}")
 
     # ------------------------------------------------------------ Logging
 
@@ -1666,7 +1668,10 @@ class MeetingRecorderGUI:
                 changed = last_hash is None or (h - last_hash) > self.DHASH_THRESHOLD
                 if changed:
                     if last_hash is not None:
-                        diff = h - last_hash
+                        # int(): imagehash returns numpy.int64, which json
+                        # cannot serialize — that silently dropped every
+                        # snapshot after the first one from the log.
+                        diff = int(h - last_hash)
                     snap_count += 1
                     ts = datetime.datetime.now().strftime('%H%M%S')
                     ms = f"{datetime.datetime.now().microsecond // 1000:03d}"
@@ -2609,21 +2614,32 @@ def collect_meeting_data(folder):
         if os.path.exists(path) and os.path.getsize(path) > 0:
             role_tracks[role] = path
 
-    # Image entries — snapshots.jsonl is authoritative, filenames are fallback
+    # Image entries. snapshots.jsonl carries the exact timings, but the folder
+    # is the source of truth for which images exist: any picture on disk that
+    # the log missed still belongs in the report, timed from its filename.
     img_entries = []
+    logged = set()
     for entry in _read_jsonl(os.path.join(folder, "snapshots.jsonl")):
         img_entries.append({
             "file": entry["file"],
             "time": entry.get("elapsed", 0.0),
             "type": entry.get("type", "auto"),
         })
-    if not img_entries:
-        start_str = meta.get("START_TIME_STR")
-        for fname in sorted(f for f in os.listdir(folder)
-                            if f.lower().endswith((".jpg", ".jpeg", ".png"))):
-            t = _image_time_from_name(fname, start_str)
-            if t is not None:
-                img_entries.append({"file": fname, "time": t, "type": "auto"})
+        logged.add(entry["file"])
+    start_str = meta.get("START_TIME_STR")
+    missing = 0
+    for fname in sorted(f for f in os.listdir(folder)
+                        if f.lower().endswith((".jpg", ".jpeg", ".png"))):
+        if fname in logged:
+            continue
+        t = _image_time_from_name(fname, start_str)
+        if t is not None:
+            img_entries.append({"file": fname, "time": t,
+                                "type": "manual" if fname.startswith("manual_")
+                                        else "auto"})
+            missing += 1
+    if missing and logged:
+        print(f"[画像] ログに無い画像 {missing}枚をファイル名から復元しました")
     img_entries.sort(key=lambda x: x["time"])
 
     # OCR text is cached so re-running post-processing never redoes it
