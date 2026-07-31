@@ -24,6 +24,7 @@
 | 7 | 要約 | なし | Ollama / Claude API による構造化要約 |
 | 8 | 出力形式 | Markdown | ＋ 単一HTML（音声シーク・検索）、DOCX |
 | 9 | 過去記録の操作 | フォルダ選択ダイアログ | 記録一覧ブラウザ（検索・再後処理） |
+| 10 | キャプチャ対象 | ディスプレイ単位 | ドラッグによる範囲指定＋長辺上限での縮小 |
 
 ---
 
@@ -263,6 +264,44 @@ post_process_folder(folder, progress=None, cancel=None)
 
 ---
 
+## 9.5 キャプチャ範囲の指定
+
+### 9.5.1 キャプチャ側
+
+mss の `grab()` は `{"left","top","width","height"}` の dict を取るため、`sct.monitors[i]` を範囲 dict に差し替えるだけでよい。`_capture_rect()` がモードに応じてどちらかを返す。
+
+範囲は録画開始時に `_recording_rect` へ固定する（dHash 閾値と同じ扱い）。
+
+### 9.5.2 選択オーバーレイ
+
+透過ウィンドウは Windows ではクリックスルーになり、取得したいドラッグ自体を素通ししてしまう。そのため**静止画を表示する不透明なオーバーレイ**とする。
+
+1. `sct.monitors[0]`（仮想画面全体）を撮影して Canvas に配置
+2. 選択範囲の上下左右を覆う**4枚の網掛け矩形**（`stipple="gray75"`）で暗転させる。座標を4組更新するだけなのでドラッグ中も軽い
+3. ドラッグ開始前は分割では全面を覆えないため、1枚目を画面全体に伸ばす
+
+### 9.5.3 DPI スケーリング
+
+tkinter の座標と mss の物理ピクセルは、プロセスが DPI 認識を持つ場合にずれる。`scale = mss.monitors[1]["width"] / root.winfo_screenwidth()` で実測し、双方向に換算する。DPI 非認識プロセスでは Windows が双方を同じように仮想化するため 1.0 になる。
+
+### 9.5.4 キャンセル経路
+
+枠なし・最前面のウィンドウは閉じるボタンを持たないため、閉じられなくなると最悪の失敗になる。経路を3つ用意する:
+
+- Tk バインド（`<Escape>` を Toplevel / Canvas / `bind_all` に登録）
+- 右クリック（`<Button-3>`）
+- **`GetAsyncKeyState(VK_ESCAPE)` の60ms ポーリング** — 枠なしウィンドウがキーフォーカスを取れない場合、Tk のキーバインドは一切発火しないため
+
+### 9.5.5 縮小
+
+`capture_max_edge`（既定1600px）を超える場合のみ `thumbnail(LANCZOS)` で縮小する。dHash は縮小後の画像に対して計算する（9×8 に落とすため結果に影響しない）。
+
+### 9.5.6 検証
+
+保存された範囲が現在の仮想画面に収まらない場合、録画開始前に続行するか確認する（ディスプレイの抜き差しや解像度変更を想定）。
+
+---
+
 ## 10. metadata.txt の追加項目
 
 ```
@@ -290,7 +329,9 @@ AUDIO_OTHER_FILE=audio_other.mp3
   "export_html": true,
   "export_docx": false,
   "html_embed_images": true,
-  "html_embed_audio": false
+  "html_embed_audio": false,
+  "capture_region": null,
+  "capture_max_edge": 1600
 }
 ```
 

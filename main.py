@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 import numpy as np
 import mss
-from PIL import Image
+from PIL import Image, ImageTk
 import imagehash
 import sounddevice as sd
 import pyaudiowpatch as pyaudio
@@ -27,6 +27,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 GLOSSARY_PATH = os.path.join(BASE_DIR, "glossary.csv")
+
+# Extra entry in the display picker: capture a dragged rectangle instead of a
+# whole monitor.
+REGION_CHOICE = "範囲を指定（ドラッグ）"
+MIN_REGION = 40          # physical px; smaller selections are almost certainly slips
 
 SUMMARY_PROVIDERS = [
     ("なし（要約しない）", "none"),
@@ -247,6 +252,7 @@ class MeetingRecorderGUI:
         self._preloaded_transcriber = None
         self._recording_dir = None
         self._recording_mon_idx = 0
+        self._recording_rect = None   # frozen at record start, like the dHash threshold
         self._pipeline_ctx = None
         self._pipeline_thread = None
         self._last_record_dir = None
@@ -289,6 +295,10 @@ class MeetingRecorderGUI:
         # System-wide key for marking an important moment mid-meeting
         self.MARKER_HOTKEY = "ctrl+shift+m"
 
+        # Screen capture area: None = whole display, else an mss rect
+        self.CAPTURE_REGION = None
+        self.CAPTURE_MAX_EDGE = 1600   # 0 disables the downscale
+
         # AI summary of the transcript, generated during post-processing
         self.SUMMARY_PROVIDER = "none"   # none | ollama | claude
         self.SUMMARY_MODEL = ""          # empty = provider default
@@ -297,6 +307,7 @@ class MeetingRecorderGUI:
         self._load_settings()
         self.create_widgets()
         self._populate_audio_listbox()
+        self._update_region_label()
         self._tick_level_meter()
 
     # --------------------------------------------------------- Settings persistence
@@ -315,6 +326,12 @@ class MeetingRecorderGUI:
                 self.REALTIME_WHISPER_MODEL = str(s.get(
                     "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
                 self.MARKER_HOTKEY = str(s.get("marker_hotkey", self.MARKER_HOTKEY))
+                self.CAPTURE_MAX_EDGE = int(s.get("capture_max_edge", self.CAPTURE_MAX_EDGE))
+                region = s.get("capture_region")
+                if isinstance(region, dict) and all(
+                        k in region for k in ("left", "top", "width", "height")):
+                    self.CAPTURE_REGION = {k: int(region[k])
+                                           for k in ("left", "top", "width", "height")}
                 self.SUMMARY_PROVIDER = str(s.get("summary_provider", self.SUMMARY_PROVIDER))
                 self.SUMMARY_MODEL = str(s.get("summary_model", self.SUMMARY_MODEL))
         except Exception as e:
@@ -339,6 +356,8 @@ class MeetingRecorderGUI:
                 "whisper_compute": self.WHISPER_COMPUTE,
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
                 "marker_hotkey": self.MARKER_HOTKEY,
+                "capture_region": self.CAPTURE_REGION,
+                "capture_max_edge": self.CAPTURE_MAX_EDGE,
                 "summary_provider": self.SUMMARY_PROVIDER,
                 "summary_model": self.SUMMARY_MODEL,
             })
@@ -378,9 +397,24 @@ class MeetingRecorderGUI:
         self.entry_meeting = ttk.Entry(frame_set, width=44)
         self.entry_meeting.grid(row=0, column=1, padx=10, pady=2)
 
-        ttk.Label(frame_set, text="対象画面:").grid(row=1, column=0, sticky="w", pady=2)
-        self.combo_monitor = ttk.Combobox(frame_set, width=42, state="readonly")
-        self.combo_monitor.grid(row=1, column=1, padx=10, pady=2)
+        ttk.Label(frame_set, text="対象画面:").grid(row=1, column=0, sticky="nw", pady=2)
+        mon_frame = ttk.Frame(frame_set)
+        mon_frame.grid(row=1, column=1, padx=10, pady=2, sticky="w")
+        self.combo_monitor = ttk.Combobox(mon_frame, width=42, state="readonly")
+        self.combo_monitor.pack(anchor="w")
+        self.combo_monitor.bind("<<ComboboxSelected>>", self._on_monitor_changed)
+
+        region_row = ttk.Frame(mon_frame)
+        region_row.pack(anchor="w", pady=(3, 0))
+        self.btn_region = ttk.Button(region_row, text="🖱 範囲を選択...",
+            command=self._select_capture_region)
+        self.btn_region.pack(side="left")
+        self.btn_region_clear = ttk.Button(region_row, text="🗑 解除",
+            width=7, command=self._clear_capture_region)
+        self.btn_region_clear.pack(side="left", padx=(4, 0))
+        self.label_region = ttk.Label(region_row, text="", font=("BIZ UDゴシック", 8),
+            foreground="#6b7280")
+        self.label_region.pack(side="left", padx=(8, 0))
 
         ttk.Label(frame_set, text="音声デバイス:").grid(row=2, column=0, sticky="nw", pady=2)
         audio_frame = ttk.Frame(frame_set)
@@ -803,6 +837,245 @@ class MeetingRecorderGUI:
         if not self.is_recording:
             self.label_status.config(text="ステータス: 停止中", foreground="#6b7280")
 
+    # ------------------------------------------------------- Capture region
+
+    @staticmethod
+    def _display_scale(root, sct):
+        """Physical pixels per tkinter unit.
+
+        1.0 for a DPI-unaware process (Windows virtualizes both tkinter and the
+        screen grab identically), but a DPI-aware host would make tkinter report
+        logical units while mss keeps reporting physical ones.
+        """
+        try:
+            logical = root.winfo_screenwidth()
+            physical = sct.monitors[1]["width"] if len(sct.monitors) > 1 else logical
+            if logical > 0 and physical > 0:
+                return physical / logical
+        except Exception as e:
+            print(f"[DPI取得警告] {e}")
+        return 1.0
+
+    def _is_region_mode(self):
+        return self.combo_monitor.get() == REGION_CHOICE
+
+    def _update_region_label(self):
+        region = self.CAPTURE_REGION
+        if region:
+            self.label_region.config(
+                text=f"{region['width']}×{region['height']} "
+                     f"(x={region['left']}, y={region['top']})",
+                foreground="#0ea5e9")
+        else:
+            self.label_region.config(text="未選択", foreground="#6b7280")
+        on = self._is_region_mode() and not self.is_recording
+        self.btn_region.config(state="normal" if on else "disabled")
+        self.btn_region_clear.config(
+            state="normal" if on and region else "disabled")
+
+    def _on_monitor_changed(self, _=None):
+        self._update_region_label()
+        if self._is_region_mode() and not self.CAPTURE_REGION:
+            self._select_capture_region()
+
+    def _clear_capture_region(self):
+        self.CAPTURE_REGION = None
+        self._save_settings()
+        self._update_region_label()
+        self._log("キャプチャ範囲を解除しました")
+
+    def _select_capture_region(self):
+        """Freeze the screen, dim it, and let the user drag out a rectangle.
+
+        The overlay shows a still screenshot rather than being see-through: a
+        genuinely transparent window would be click-through on Windows, which
+        would swallow the drag we are trying to capture.
+        """
+        if self.is_recording:
+            return
+        try:
+            with mss.MSS() as sct:
+                virt = dict(sct.monitors[0])
+                scale = self._display_scale(self.root, sct)
+                shot = sct.grab(virt)
+            base = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception as e:
+            messagebox.showerror("エラー", f"画面を取得できません:\n{e}")
+            return
+
+        win_w = max(1, int(round(virt["width"] / scale)))
+        win_h = max(1, int(round(virt["height"] / scale)))
+        win_x = int(round(virt["left"] / scale))
+        win_y = int(round(virt["top"] / scale))
+        if (win_w, win_h) != base.size:
+            base = base.resize((win_w, win_h), Image.LANCZOS)
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+        canvas = tk.Canvas(win, width=win_w, height=win_h, highlightthickness=0,
+                           cursor="crosshair", bg="black")
+        canvas.pack()
+        photo = ImageTk.PhotoImage(base)
+        canvas.create_image(0, 0, image=photo, anchor="nw")
+        canvas.image = photo   # keep a reference or Tk drops the image
+
+        # Four dimmed panels around the selection give a real "hole" without
+        # any window transparency, and updating them is four coordinate sets.
+        shades = [canvas.create_rectangle(0, 0, 0, 0, fill="black",
+                                          stipple="gray75", outline="")
+                  for _ in range(4)]
+        box = canvas.create_rectangle(0, 0, 0, 0, outline="#38bdf8", width=2)
+        size_text = canvas.create_text(0, 0, text="", anchor="nw", fill="#ffffff",
+                                       font=("BIZ UDゴシック", 12, "bold"))
+        canvas.create_text(win_w // 2, 20, anchor="n", fill="#ffffff",
+                           font=("BIZ UDゴシック", 13, "bold"),
+                           text="ドラッグして範囲を選択    /    Esc でキャンセル")
+
+        def _shade(x0, y0, x1, y1):
+            canvas.coords(shades[0], 0, 0, win_w, y0)          # above
+            canvas.coords(shades[1], 0, y1, win_w, win_h)      # below
+            canvas.coords(shades[2], 0, y0, x0, y1)            # left
+            canvas.coords(shades[3], x1, y0, win_w, y1)        # right
+
+        # Before the first drag there is no hole to leave, and the four-panel
+        # split cannot cover the screen on its own — stretch one panel over it.
+        canvas.coords(shades[0], 0, 0, win_w, win_h)
+        state = {"x0": 0, "y0": 0, "dragging": False, "rect": None}
+
+        def _corners(event):
+            return (min(state["x0"], event.x), min(state["y0"], event.y),
+                    max(state["x0"], event.x), max(state["y0"], event.y))
+
+        def _on_press(event):
+            state.update(x0=event.x, y0=event.y, dragging=True)
+
+        def _on_move(event):
+            if not state["dragging"]:
+                return
+            x0, y0, x1, y1 = _corners(event)
+            canvas.coords(box, x0, y0, x1, y1)
+            _shade(x0, y0, x1, y1)
+            canvas.itemconfig(size_text, text=f"{int((x1 - x0) * scale)} × "
+                                              f"{int((y1 - y0) * scale)}")
+            canvas.coords(size_text, x0 + 6, y0 + 6 if y0 + 30 < win_h else y0 - 26)
+
+        def _on_release(event):
+            if not state["dragging"]:
+                return
+            state["dragging"] = False
+            x0, y0, x1, y1 = _corners(event)
+            state["rect"] = {
+                "left": int(round(virt["left"] + x0 * scale)),
+                "top": int(round(virt["top"] + y0 * scale)),
+                "width": int(round((x1 - x0) * scale)),
+                "height": int(round((y1 - y0) * scale)),
+            }
+            win.destroy()
+
+        canvas.bind("<ButtonPress-1>", _on_press)
+        canvas.bind("<B1-Motion>", _on_move)
+        canvas.bind("<ButtonRelease-1>", _on_release)
+        # A borderless topmost window has no close button, so cancelling must
+        # not hinge on one binding landing: Escape from anywhere in the app,
+        # and right-click on the overlay itself.
+        cancel = lambda _e=None: win.destroy()
+        for widget in (win, canvas):
+            widget.bind("<Escape>", cancel)
+            widget.bind("<Button-3>", cancel)
+        win.bind_all("<Escape>", cancel)
+
+        def _poll_escape():
+            """Watch the physical Escape key, not just Tk's focused widget.
+
+            A borderless topmost window can end up without keyboard focus — if
+            that happens the key bindings never fire and the overlay would be
+            unclosable, so ask Windows directly instead.
+            """
+            if not win.winfo_exists():
+                return
+            try:
+                import ctypes
+                if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:  # VK_ESCAPE
+                    win.destroy()
+                    return
+            except Exception as e:
+                print(f"[範囲選択警告] Escape 監視を停止: {e}")
+                return
+            win.after(60, _poll_escape)
+
+        if os.name == "nt":
+            win.after(60, _poll_escape)
+        win.focus_force()
+        canvas.focus_set()
+        win.grab_set()
+        try:
+            self.root.wait_window(win)
+        finally:
+            try:
+                win.unbind_all("<Escape>")
+            except tk.TclError:
+                pass
+
+        rect = state["rect"]
+        if not rect:
+            self._log("範囲選択をキャンセルしました")
+            self._update_region_label()
+            return
+        if rect["width"] < MIN_REGION or rect["height"] < MIN_REGION:
+            messagebox.showwarning("範囲が小さすぎます",
+                f"{MIN_REGION}×{MIN_REGION} ピクセル以上を選択してください。\n"
+                f"（選択: {rect['width']}×{rect['height']}）")
+            self._update_region_label()
+            return
+
+        self.CAPTURE_REGION = rect
+        if not self._is_region_mode():
+            values = list(self.combo_monitor["values"])
+            if REGION_CHOICE in values:
+                self.combo_monitor.current(values.index(REGION_CHOICE))
+        self._save_settings()
+        self._update_region_label()
+        self._log(f"キャプチャ範囲: {rect['width']}×{rect['height']} "
+                  f"(x={rect['left']}, y={rect['top']})")
+
+    def _capture_rect(self, sct):
+        """The rectangle to grab — a chosen region, or the selected display."""
+        if self._is_region_mode() and self.CAPTURE_REGION:
+            return dict(self.CAPTURE_REGION)
+        idx = min(max(self._recording_mon_idx, 0), len(sct.monitors) - 1)
+        return dict(sct.monitors[idx])
+
+    def _grab_image(self, sct, rect):
+        """Grab a frame and shrink it if its long edge exceeds the limit."""
+        shot = sct.grab(rect)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        limit = self.CAPTURE_MAX_EDGE
+        if limit and max(img.size) > limit:
+            img.thumbnail((limit, limit), Image.LANCZOS)
+        return img
+
+    def _validate_region(self):
+        """Reject a stale region — displays get unplugged and resolutions change."""
+        if not (self._is_region_mode() and self.CAPTURE_REGION):
+            return True
+        region = self.CAPTURE_REGION
+        with mss.MSS() as sct:
+            virt = sct.monitors[0]
+        inside = (region["left"] >= virt["left"]
+                  and region["top"] >= virt["top"]
+                  and region["left"] + region["width"] <= virt["left"] + virt["width"]
+                  and region["top"] + region["height"] <= virt["top"] + virt["height"])
+        if inside:
+            return True
+        return messagebox.askyesno(
+            "範囲が画面外です",
+            f"保存されている範囲 ({region['left']},{region['top']} "
+            f"{region['width']}×{region['height']}) が現在の画面に収まりません。\n"
+            "ディスプレイ構成が変わった可能性があります。\n\n"
+            "このまま録画を開始しますか？（画面外は黒く記録されます）")
+
     # ------------------------------------------------------ Recordings browser
 
     def _scan_recordings(self):
@@ -1024,6 +1297,20 @@ class MeetingRecorderGUI:
         lbl_jpeg.grid(row=2, column=2, pady=4)
         var_jpeg.trace_add("write", lambda *_: lbl_jpeg.config(text=str(var_jpeg.get())))
 
+        # Capture long-edge limit
+        ttk.Label(frame, text="画像の長辺上限:").grid(row=3, column=0, sticky="w", pady=4)
+        var_edge = tk.IntVar(value=self.CAPTURE_MAX_EDGE)
+        scale_edge = tk.Scale(frame, from_=0, to=3840, resolution=160,
+            orient="horizontal", variable=var_edge, length=220, showvalue=False)
+        scale_edge.grid(row=3, column=1, padx=(10, 4), pady=4)
+        lbl_edge = ttk.Label(frame, text=str(self.CAPTURE_MAX_EDGE), width=5)
+        lbl_edge.grid(row=3, column=2, pady=4)
+        var_edge.trace_add("write", lambda *_: lbl_edge.config(
+            text=(str(var_edge.get()) if var_edge.get() else "無制限")))
+        ttk.Label(frame, text="※ 0 で無効。超えた場合だけ縮小します",
+            font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
+            row=4, column=0, columnspan=3, sticky="w")
+
         # AI summary
         sum_frame = ttk.LabelFrame(dlg, text=" AI要約（後処理） ", padding=15)
         sum_frame.pack(padx=15, pady=(0, 10), fill="x")
@@ -1055,6 +1342,7 @@ class MeetingRecorderGUI:
             self.DHASH_THRESHOLD = var_dhash.get()
             self.AUDIO_GAIN = var_gain.get()
             self.JPEG_QUALITY = var_jpeg.get()
+            self.CAPTURE_MAX_EDGE = var_edge.get()
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
             self.SUMMARY_MODEL = entry_model.get().strip()
             self._save_settings()
@@ -1172,9 +1460,8 @@ class MeetingRecorderGUI:
             return
         try:
             with mss.MSS() as sct:
-                monitor = sct.monitors[self._recording_mon_idx]
-                cap = sct.grab(monitor)
-            img = Image.frombytes("RGB", cap.size, cap.bgra, "raw", "BGRX")
+                img = self._grab_image(sct, self._recording_rect or
+                                       self._capture_rect(sct))
             now = datetime.datetime.now()
             ts = now.strftime('%H%M%S')
             ms = f"{now.microsecond // 1000:03d}"
@@ -1207,6 +1494,7 @@ class MeetingRecorderGUI:
                     vals.append(f"画面 [0]: 全画面 (Virtual Screen)")
                 else:
                     vals.append(f"画面 [{i}]: ディスプレイ {i} ({m['width']}x{m['height']})")
+            vals.append(REGION_CHOICE)
             self.combo_monitor["values"] = vals
             self.combo_monitor.current(0)
 
@@ -1232,6 +1520,8 @@ class MeetingRecorderGUI:
                 messagebox.showwarning("音声デバイス未選択",
                     "録音するオーディオデバイスを1つ以上選択してください。")
                 return
+            if not self._validate_region():
+                return
             self._meeting_name = self.entry_meeting.get().strip()
             self.is_recording = True
             self.stop_event.clear()
@@ -1239,6 +1529,8 @@ class MeetingRecorderGUI:
             self._queue_overflow_count = 0
             self._record_start = time.time()
             self._recording_mon_idx = self.combo_monitor.current()
+            with mss.MSS() as sct:
+                self._recording_rect = self._capture_rect(sct)
             self._marker_count = 0
             self.btn_toggle.config(text="■ 記録を停止して保存", bg="#ef4444")
             self.btn_manual_snap.config(state="normal")
@@ -1249,6 +1541,8 @@ class MeetingRecorderGUI:
             self.listbox_audio.config(state="disabled")
             self.btn_refresh_audio.config(state="disabled")
             self.btn_select_all_audio.config(state="disabled")
+            self.btn_region.config(state="disabled")
+            self.btn_region_clear.config(state="disabled")
             self.entry_meeting.config(state="disabled")
             # combo_lang stays enabled for mid-recording language switching
             self._tick_elapsed_timer()
@@ -1281,6 +1575,8 @@ class MeetingRecorderGUI:
         self.listbox_audio.config(state="normal")
         self.btn_refresh_audio.config(state="normal")
         self.btn_select_all_audio.config(state="normal")
+        self._recording_rect = None
+        self._update_region_label()
         self.entry_meeting.config(state="normal")
 
     # ----------------------------------------------------------- Main pipeline
@@ -1349,18 +1645,17 @@ class MeetingRecorderGUI:
         next_target = time.time() + self.INTERVAL
         last_hash = None
         snap_count = 0
-        mon_idx = self.combo_monitor.current()
-
         with mss.MSS() as sct:
-            monitor = sct.monitors[mon_idx]
+            monitor = self._recording_rect or self._capture_rect(sct)
+            self.root.after(0, self._log,
+                f"キャプチャ対象: {monitor['width']}×{monitor['height']} "
+                f"(x={monitor['left']}, y={monitor['top']})")
             while self.is_recording and not self.stop_event.is_set():
                 dt = next_target - time.time()
                 if dt > 0:
                     time.sleep(dt)
                 try:
-                    img = Image.frombytes(
-                        "RGB", (cap := sct.grab(monitor)).size,
-                        cap.bgra, "raw", "BGRX")
+                    img = self._grab_image(sct, monitor)
                     h = imagehash.dhash(img)
                 except Exception as e:
                     self.root.after(0, self._log, f"[画面エラー] {e}")
