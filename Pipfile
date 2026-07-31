@@ -14,6 +14,11 @@ numpy = "*"
 scipy = "*"
 faster-whisper = "*"
 
+[optional]
+# AI要約で summary_provider="claude" を選ぶ場合のみ必要
+# （Ollama とローカル完結の利用時は不要）
+anthropic = "*"
+
 [dev-packages]
 
 [requires]
