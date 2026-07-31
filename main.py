@@ -38,6 +38,101 @@ ROLE_TRACK_SELF = "audio_self.mp3"
 ROLE_TRACK_OTHER = "audio_other.mp3"
 
 
+class _GlobalHotkey:
+    """A system-wide hotkey, registered with Win32 on its own thread.
+
+    tkinter's `bind` only fires while the app has focus, but during a meeting
+    the foreground window is Teams or Zoom — so marking an important moment
+    needs a hotkey the OS delivers no matter what is on top. RegisterHotKey
+    binds to the calling thread's message queue, so registration and the
+    message pump have to live on the same thread.
+    """
+
+    MODIFIERS = {"alt": 0x0001, "ctrl": 0x0002, "control": 0x0002,
+                 "shift": 0x0004, "win": 0x0008}
+    MOD_NOREPEAT = 0x4000
+    WM_HOTKEY = 0x0312
+    WM_QUIT = 0x0012
+
+    def __init__(self, spec, callback, log=print):
+        self.spec = spec
+        self.callback = callback
+        self.log = log
+        self.mods, self.vk = self._parse(spec)
+        self._thread = None
+        self._thread_id = None
+        self._ready = threading.Event()
+        self.registered = False
+
+    @classmethod
+    def _parse(cls, spec):
+        """'ctrl+shift+m' -> (modifier mask, virtual key code)."""
+        mods = cls.MOD_NOREPEAT
+        vk = None
+        for part in str(spec).lower().split("+"):
+            part = part.strip()
+            if not part:
+                continue
+            if part in cls.MODIFIERS:
+                mods |= cls.MODIFIERS[part]
+            elif len(part) == 1:
+                vk = ord(part.upper())
+            elif part.startswith("f") and part[1:].isdigit():
+                vk = 0x70 + int(part[1:]) - 1      # VK_F1 == 0x70
+        return mods, vk
+
+    def start(self):
+        if os.name != "nt" or self.vk is None:
+            self.log(f"[ホットキー] 使用できません: {self.spec}")
+            return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2)
+        return self.registered
+
+    def _run(self):
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        hotkey_id = 1
+        try:
+            ok = user32.RegisterHotKey(None, hotkey_id, self.mods, self.vk)
+        except Exception as e:
+            self.log(f"[ホットキー] 登録失敗: {e}")
+            self._ready.set()
+            return
+        if not ok:
+            # Almost always means another application already owns the combo.
+            self.log(f"[ホットキー] {self.spec} は他のアプリが使用中のため登録できません")
+            self._ready.set()
+            return
+        self.registered = True
+        self._ready.set()
+        try:
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == self.WM_HOTKEY and msg.wParam == hotkey_id:
+                    try:
+                        self.callback()
+                    except Exception as e:
+                        print(f"[ホットキー処理警告] {e}")
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
+            self.registered = False
+
+    def stop(self):
+        if self._thread is None or self._thread_id is None:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, self.WM_QUIT, 0, 0)
+        except Exception as e:
+            print(f"[ホットキー終了警告] {e}")
+        self._thread = None
+
+
 class _PcmWriter:
     """An ffmpeg encoder fed stereo s16le PCM on stdin (the Captura pattern).
 
@@ -148,6 +243,9 @@ class MeetingRecorderGUI:
         self._rt_lang = None  # None = auto (ja/en detect), else fixed lang code
         self._post_cancel = threading.Event()
         self._post_running = False
+        self._marker_lock = threading.Lock()
+        self._marker_count = 0
+        self._hotkey = None
 
         self._audio_devices = []        # list of enumerated device dicts
         self._audio_queues = []         # per-device capture queues (during recording)
@@ -175,6 +273,9 @@ class MeetingRecorderGUI:
         # faster-whisper (real-time) settings — smaller model for low latency
         self.REALTIME_WHISPER_MODEL = "base"
 
+        # System-wide key for marking an important moment mid-meeting
+        self.MARKER_HOTKEY = "ctrl+shift+m"
+
         self._enumerate_audio_devices()
         self._load_settings()
         self.create_widgets()
@@ -196,6 +297,7 @@ class MeetingRecorderGUI:
                 self.WHISPER_COMPUTE = str(s.get("whisper_compute", self.WHISPER_COMPUTE))
                 self.REALTIME_WHISPER_MODEL = str(s.get(
                     "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
+                self.MARKER_HOTKEY = str(s.get("marker_hotkey", self.MARKER_HOTKEY))
         except Exception as e:
             print(f"[設定読み込み警告] {e}")
 
@@ -217,6 +319,7 @@ class MeetingRecorderGUI:
                 "whisper_device": self.WHISPER_DEVICE,
                 "whisper_compute": self.WHISPER_COMPUTE,
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
+                "marker_hotkey": self.MARKER_HOTKEY,
             })
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(existing, f, indent=2, ensure_ascii=False)
@@ -324,6 +427,12 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=8,
             command=self._manual_snapshot, state="disabled")
         self.btn_manual_snap.pack(side="right", padx=(6, 0))
+
+        self.btn_marker = tk.Button(
+            row_buttons, text="⭐ マーカー", bg="#f59e0b", fg="white",
+            font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=8,
+            command=self._add_marker, state="disabled")
+        self.btn_marker.pack(side="right", padx=(6, 0))
 
         row_post = ttk.Frame(frame_ctrl)
         row_post.pack(fill="x", pady=(3, 0))
@@ -766,6 +875,46 @@ class MeetingRecorderGUI:
         except Exception as e:
             print(f"[言語セグメント書き込み警告] {e}")
 
+    def _start_hotkey(self):
+        """Register the marker hotkey for the duration of the recording."""
+        self._stop_hotkey()
+        if not self.MARKER_HOTKEY:
+            return
+        self._hotkey = _GlobalHotkey(self.MARKER_HOTKEY, self._add_marker,
+                                     log=lambda m: self.root.after(0, self._log, m))
+        if self._hotkey.start():
+            self._log(f"マーカーのホットキー: {self.MARKER_HOTKEY}（他アプリ使用中でも有効）")
+
+    def _stop_hotkey(self):
+        if self._hotkey is not None:
+            self._hotkey.stop()
+            self._hotkey = None
+
+    def _add_marker(self, label=None):
+        """Bookmark the current moment. Callable from the UI or the hotkey thread."""
+        if not self.is_recording or not self._recording_dir:
+            return
+        elapsed = time.time() - self._record_start
+        entry = {
+            "elapsed": round(elapsed, 3),
+            "epoch": round(time.time(), 3),
+            "label": label or "重要",
+        }
+        try:
+            with self._marker_lock:
+                path = os.path.join(self._recording_dir, "markers.jsonl")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self._marker_count += 1
+            count = self._marker_count
+        except Exception as e:
+            self.root.after(0, self._log, f"[マーカー書き込み警告] {e}")
+            return
+        m, s = divmod(int(elapsed), 60)
+        # May arrive from the hotkey thread, so touch the UI via after().
+        self.root.after(0, self._log,
+                        f"⭐ マーカー {count}: [{m:02d}:{s:02d}] {entry['label']}")
+
     def _write_snapshot_log(self, fname, snap_type, diff):
         if not self._recording_dir:
             return
@@ -858,8 +1007,11 @@ class MeetingRecorderGUI:
             self._queue_overflow_count = 0
             self._record_start = time.time()
             self._recording_mon_idx = self.combo_monitor.current()
+            self._marker_count = 0
             self.btn_toggle.config(text="■ 記録を停止して保存", bg="#ef4444")
             self.btn_manual_snap.config(state="normal")
+            self.btn_marker.config(state="normal")
+            self._start_hotkey()
             for w in (self.combo_monitor, self.combo_mode):
                 w.config(state="disabled")
             self.listbox_audio.config(state="disabled")
@@ -874,8 +1026,10 @@ class MeetingRecorderGUI:
             # UI resets instantly; cleanup runs in background
             self.is_recording = False
             self.stop_event.set()
+            self._stop_hotkey()
             self.btn_toggle.config(state="disabled")
             self.btn_manual_snap.config(state="disabled")
+            self.btn_marker.config(state="disabled")
             self.label_status.config(text="ステータス: 保存処理中...", foreground="#f59e0b")
             threading.Thread(target=self._async_cleanup, daemon=True).start()
 
@@ -885,8 +1039,10 @@ class MeetingRecorderGUI:
         self._audio_level = 0.0
         self._queue_overflow_count = 0
         self._recording_dir = None
+        self._stop_hotkey()
         self.btn_toggle.config(text="▶ 会議記録を開始", bg="#10b981", state="normal")
         self.btn_manual_snap.config(state="disabled")
+        self.btn_marker.config(state="disabled")
         self.label_status.config(text="ステータス: 停止中", foreground="#6b7280")
         for w in (self.combo_monitor, self.combo_mode):
             w.config(state="readonly")
@@ -1039,6 +1195,7 @@ class MeetingRecorderGUI:
             f.write(f"AUDIO_SOURCE={ctx['audio_src_str']}\n")
             f.write(f"MODE={'full' if ctx['mode_full'] else 'light'}\n")
             f.write(f"SNAPSHOT_COUNT={ctx['snap_count']}\n")
+            f.write(f"MARKER_COUNT={self._marker_count}\n")
             f.write("AUDIO_FILE=audio_main.mp3\n")
             f.write(f"LANGUAGE={ctx['lang']}\n")
             if ctx['role_tracks']:
