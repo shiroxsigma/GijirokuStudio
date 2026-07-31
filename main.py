@@ -2708,6 +2708,9 @@ def _ocr_windows(paths, lang):
     """Run the Windows OCR engine over a batch of images. {path: text}."""
     if os.name != "nt":
         raise RuntimeError("Windows OCR は Windows 専用です")
+    # StorageFile.GetFileFromPathAsync rejects forward slashes, and tkinter's
+    # askdirectory() hands back exactly that on Windows.
+    paths = [os.path.normpath(os.path.abspath(p)) for p in paths]
     tmpdir = tempfile.mkdtemp(prefix="gjs_ocr_")
     try:
         script = os.path.join(tmpdir, "ocr.ps1")
