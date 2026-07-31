@@ -299,6 +299,10 @@ class MeetingRecorderGUI:
         self.CAPTURE_REGION = None
         self.CAPTURE_MAX_EDGE = 1600   # 0 disables the downscale
 
+        # Slide OCR during post-processing. Off by default: it needs the
+        # Windows Japanese OCR language pack and adds time to every run.
+        self.OCR_ENABLED = False
+
         # AI summary of the transcript, generated during post-processing
         self.SUMMARY_PROVIDER = "none"   # none | ollama | claude
         self.SUMMARY_MODEL = ""          # empty = provider default
@@ -332,6 +336,7 @@ class MeetingRecorderGUI:
                         k in region for k in ("left", "top", "width", "height")):
                     self.CAPTURE_REGION = {k: int(region[k])
                                            for k in ("left", "top", "width", "height")}
+                self.OCR_ENABLED = bool(s.get("ocr_enabled", self.OCR_ENABLED))
                 self.SUMMARY_PROVIDER = str(s.get("summary_provider", self.SUMMARY_PROVIDER))
                 self.SUMMARY_MODEL = str(s.get("summary_model", self.SUMMARY_MODEL))
         except Exception as e:
@@ -358,6 +363,7 @@ class MeetingRecorderGUI:
                 "marker_hotkey": self.MARKER_HOTKEY,
                 "capture_region": self.CAPTURE_REGION,
                 "capture_max_edge": self.CAPTURE_MAX_EDGE,
+                "ocr_enabled": self.OCR_ENABLED,
                 "summary_provider": self.SUMMARY_PROVIDER,
                 "summary_model": self.SUMMARY_MODEL,
             })
@@ -1311,6 +1317,15 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
             row=4, column=0, columnspan=3, sticky="w")
 
+        # Slide OCR
+        var_ocr = tk.BooleanVar(value=self.OCR_ENABLED)
+        ttk.Checkbutton(frame, text="スライドOCR（後処理で画像から文字を抽出）",
+            variable=var_ocr).grid(row=5, column=0, columnspan=3, sticky="w",
+                                   pady=(8, 0))
+        ttk.Label(frame, text="※ Windows の日本語OCR言語パックが必要です",
+            font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
+            row=6, column=0, columnspan=3, sticky="w")
+
         # AI summary
         sum_frame = ttk.LabelFrame(dlg, text=" AI要約（後処理） ", padding=15)
         sum_frame.pack(padx=15, pady=(0, 10), fill="x")
@@ -1343,11 +1358,13 @@ class MeetingRecorderGUI:
             self.AUDIO_GAIN = var_gain.get()
             self.JPEG_QUALITY = var_jpeg.get()
             self.CAPTURE_MAX_EDGE = var_edge.get()
+            self.OCR_ENABLED = var_ocr.get()
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
             self.SUMMARY_MODEL = entry_model.get().strip()
             self._save_settings()
             self._log(f"設定更新: dHash={self.DHASH_THRESHOLD}, ゲイン={self.AUDIO_GAIN:.1f}, "
-                      f"JPEG={self.JPEG_QUALITY}, 要約={self.SUMMARY_PROVIDER}")
+                      f"JPEG={self.JPEG_QUALITY}, OCR={'有効' if self.OCR_ENABLED else '無効'}, "
+                      f"要約={self.SUMMARY_PROVIDER}")
             dlg.destroy()
 
         def _cancel():
@@ -3080,7 +3097,7 @@ def ocr_images(data, report):
     meeting. Results are cached so re-running post-processing never redoes it.
     """
     cfg = load_app_settings()
-    if not cfg.get("ocr_enabled", True):
+    if not cfg.get("ocr_enabled", False):
         return 0
     folder = data["folder"]
     done = {e.get("file") for e in _read_jsonl(os.path.join(folder, "ocr.jsonl"))}

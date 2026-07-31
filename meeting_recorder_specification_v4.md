@@ -189,6 +189,7 @@ post_process_folder(folder, progress=None, cancel=None)
 - 画像単位の失敗は理由をログに出す（無言の空文字は「白紙のスライド」と区別できない）
 - 結果は `ocr.jsonl` にキャッシュ。空文字も記録するため、読めない画像を毎回試し直さない
 - 実行は後処理フェーズのみ（録画中のCPUは会議のために空ける）
+- **既定は OFF。** 日本語OCR言語パックの有無に環境差があり、後処理時間も伸びるため、明示的に有効化させる。設定ダイアログのチェックボックスで切替
 
 ---
 
@@ -323,7 +324,7 @@ AUDIO_OTHER_FILE=audio_other.mp3
   "ollama_url": "http://localhost:11434",
   "summary_chunk_chars": 6000,
   "anthropic_api_key": "",
-  "ocr_enabled": true,
+  "ocr_enabled": false,
   "ocr_backend": "auto",
   "ocr_lang": "ja",
   "export_html": true,
