@@ -38,6 +38,59 @@ ROLE_TRACK_SELF = "audio_self.mp3"
 ROLE_TRACK_OTHER = "audio_other.mp3"
 
 
+class _PcmWriter:
+    """An ffmpeg encoder fed stereo s16le PCM on stdin (the Captura pattern).
+
+    Role tracks pass `transcription_only`: they are downmixed to 16kHz mono at
+    64kbps because nothing ever listens to them — they exist to be handed to
+    whisper — while audio_main.mp3 stays full quality. Both are fed the exact
+    same PCM, so ffmpeg's resampling keeps them on one timeline.
+    """
+
+    def __init__(self, path, rate, transcription_only=False):
+        self.path = path
+        self.written = 0
+        args = [FFMPEG_PATH, "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ar", str(rate), "-ac", "2", "-i", "-", "-c:a", "libmp3lame"]
+        if transcription_only:
+            args += ["-ar", "16000", "-ac", "1", "-b:a", "64k"]
+        else:
+            args += ["-b:a", "192k"]
+        args += ["-y", path]
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=flags)
+
+    def write(self, pcm_bytes):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        try:
+            self.proc.stdin.write(pcm_bytes)
+            self.written += len(pcm_bytes)
+        except (BrokenPipeError, OSError, ValueError):
+            pass   # one dead encoder must not stop the others
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except Exception as e:
+            print(f"[ffmpeg終了警告] stdin ({os.path.basename(self.path)}): {e}")
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=5)
+            except Exception as e:
+                print(f"[ffmpeg終了警告] kill: {e}")
+        except Exception as e:
+            print(f"[ffmpeg終了警告] wait: {e}")
+        self.proc = None
+
+
 def _com_initialize():
     """Initialise COM on the calling thread; True if we own the initialisation.
 
@@ -77,7 +130,8 @@ class MeetingRecorderGUI:
 
         self.is_recording = False
         self.stop_event = threading.Event()
-        self.ffmpeg_proc = None
+        self.ffmpeg_proc = None       # _PcmWriter for the mixed audio
+        self._role_writers = {}       # role -> _PcmWriter (speaker separation)
         self.transcriber = None
         self.transcription_file = None
         self._transcribe_start = 0
@@ -867,8 +921,13 @@ class MeetingRecorderGUI:
         self._audio_queues = [queue.Queue(maxsize=200) for _ in range(n)]
         self.transcribe_queue = queue.Queue(maxsize=400) if mode_full else None
 
-        self.ffmpeg_proc = self._ffmpeg_start(out_mp3)
-        if self.ffmpeg_proc is None:
+        # Speaker separation needs both sides captured; with one side there is
+        # nothing to separate and the role tracks would just duplicate the mix.
+        n_mic = sum(1 for d in selected if d["kind"] == "mic")
+        n_spk = sum(1 for d in selected if d["kind"] == "speaker")
+        separate = n > 1 and n_mic >= 1 and n_spk >= 1
+
+        if not self._start_writers(dir_name, out_mp3, separate):
             self.root.after(0, self._log, "[エラー] ffmpeg 起動失敗")
             self.root.after(0, self._reset_ui)
             return
@@ -944,6 +1003,7 @@ class MeetingRecorderGUI:
             'audio_src_str': self._audio_source_label_n(selected),
             'snap_count': snap_count, 'lang': lang,
             'meeting_name': self._meeting_name,
+            'role_tracks': sorted(self._role_writers),
         }
 
     def _async_cleanup(self):
@@ -954,7 +1014,7 @@ class MeetingRecorderGUI:
             self._pipeline_thread = None
         ctx = self._pipeline_ctx
         if ctx is None:
-            self._ffmpeg_stop()
+            self._stop_writers()
             self.root.after(0, self._reset_ui)
             return
 
@@ -967,7 +1027,7 @@ class MeetingRecorderGUI:
         if ctx['writer_t']:
             ctx['writer_t'].join(timeout=3)
 
-        self._ffmpeg_stop()
+        self._stop_writers()
         if ctx['mode_full']:
             self._transcription_stop()
 
@@ -981,6 +1041,10 @@ class MeetingRecorderGUI:
             f.write(f"SNAPSHOT_COUNT={ctx['snap_count']}\n")
             f.write("AUDIO_FILE=audio_main.mp3\n")
             f.write(f"LANGUAGE={ctx['lang']}\n")
+            if ctx['role_tracks']:
+                f.write(f"ROLE_TRACKS={','.join(ctx['role_tracks'])}\n")
+                f.write(f"AUDIO_SELF_FILE={ROLE_TRACK_SELF}\n")
+                f.write(f"AUDIO_OTHER_FILE={ROLE_TRACK_OTHER}\n")
             if ctx['mode_full']:
                 f.write("TRANSCRIPTION_FILE=transcription.txt\n")
 
@@ -1008,47 +1072,60 @@ class MeetingRecorderGUI:
 
     # --------------------------------------------------- FFmpeg (Captura pattern)
 
-    def _ffmpeg_start(self, path):
+    def _start_writers(self, dir_name, out_mp3, separate):
+        """Open the mixed-audio encoder and, when separating speakers, the role
+        tracks. Returns False if the main encoder could not start."""
+        self.ffmpeg_proc = None
+        self._role_writers = {}
         try:
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            return subprocess.Popen(
-                [FFMPEG_PATH,
-                 "-f", "s16le", "-acodec", "pcm_s16le",
-                 "-ar", str(self.TARGET_RATE), "-ac", "2", "-i", "-",
-                 "-c:a", "libmp3lame", "-b:a", "192k", "-y", path],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, creationflags=flags)
+            self.ffmpeg_proc = _PcmWriter(out_mp3, self.TARGET_RATE)
         except Exception as e:
             self.root.after(0, self._log, f"[ffmpegエラー] {e}")
-            return None
-
-    def _ffmpeg_write(self, pcm_bytes):
-        if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
+            return False
+        if not separate:
+            return True
+        for role, fname in ((ROLE_SELF, ROLE_TRACK_SELF),
+                            (ROLE_OTHER, ROLE_TRACK_OTHER)):
+            path = os.path.join(dir_name, fname)
             try:
-                self.ffmpeg_proc.stdin.write(pcm_bytes)
-                self._pcm_written += len(pcm_bytes)
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-
-    def _ffmpeg_stop(self):
-        if not self.ffmpeg_proc:
-            return
-        try:
-            self.ffmpeg_proc.stdin.close()
-        except Exception as e:
-            print(f"[ffmpeg終了警告] stdin: {e}")
-        try:
-            self.ffmpeg_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.ffmpeg_proc.kill()
-            try:
-                self.ffmpeg_proc.wait(timeout=5)
+                self._role_writers[role] = _PcmWriter(
+                    path, self.TARGET_RATE, transcription_only=True)
             except Exception as e:
-                print(f"[ffmpeg終了警告] kill: {e}")
-        except Exception as e:
-            print(f"[ffmpeg終了警告] wait: {e}")
-        self.root.after(0, self._log, "ffmpeg エンコード完了 -> MP3 保存済み")
-        self.ffmpeg_proc = None
+                self.root.after(0, self._log, f"[話者トラック警告] {role}: {e}")
+        if self._role_writers:
+            self.root.after(0, self._log,
+                "話者分離を有効化（自分=マイク / 相手=スピーカー）")
+        return True
+
+    def _write_audio(self, main_pcm, role_chunks=None):
+        """Write one output chunk to the mix and to every role track.
+
+        Each role track advances by exactly as many bytes as the main mix —
+        silence where that role contributed nothing — so the three files stay
+        on one timeline and transcript timestamps remain comparable.
+        """
+        self._pcm_written += len(main_pcm)
+        if self.ffmpeg_proc is not None:
+            self.ffmpeg_proc.write(main_pcm)
+        if not self._role_writers:
+            return
+        silence = None
+        for role, writer in self._role_writers.items():
+            chunk = role_chunks.get(role) if role_chunks else None
+            if chunk is None:
+                if silence is None:
+                    silence = bytes(len(main_pcm))
+                chunk = silence
+            writer.write(chunk)
+
+    def _stop_writers(self):
+        for writer in list(self._role_writers.values()):
+            writer.close()
+        self._role_writers = {}
+        if self.ffmpeg_proc is not None:
+            self.ffmpeg_proc.close()
+            self.ffmpeg_proc = None
+            self.root.after(0, self._log, "ffmpeg エンコード完了 -> MP3 保存済み")
 
     # ---------------------------------------------------- Audio normalization
 
@@ -1100,7 +1177,7 @@ class MeetingRecorderGUI:
             if pcm is _EOF:
                 break
             self._update_level(pcm)
-            self._ffmpeg_write(pcm)
+            self._write_audio(pcm)
             self._push_transcribe(pcm)
 
     # ------------------------------------------------- Mixer thread (N inputs)
@@ -1133,17 +1210,31 @@ class MeetingRecorderGUI:
         emitted = 0                 # bytes pushed downstream, for silence padding
         SILENCE = bytes(MIX_BYTES)
 
+        # Which speaker each source belongs to: mics are me, loopbacks are them.
+        # Left as None when no role tracks are open, so the sub-mix work below
+        # is skipped entirely rather than computed and thrown away.
+        role_of = [None] * N
+        if devices and self._role_writers:
+            role_of = [ROLE_SELF if d.get("kind") == "mic" else ROLE_OTHER
+                       for d in devices[:N]] + [None] * max(0, N - len(devices))
+
         def _name(i):
             if devices and i < len(devices):
                 return devices[i]["name"]
             return f"source{i}"
 
-        def _emit(raw):
+        def _emit(raw, role_chunks=None):
             nonlocal emitted
             emitted += len(raw)
             self._update_level(raw)
-            self._ffmpeg_write(raw)
+            self._write_audio(raw, role_chunks)
             self._push_transcribe(raw)
+
+        def _solo(i):
+            """A single source's chunk, tagged with its role for the role track."""
+            raw = bytes(bufs[i][:MIX_BYTES])
+            del bufs[i][:MIX_BYTES]
+            return raw, ({role_of[i]: raw} if role_of[i] else None)
 
         def _drain(i):
             for _ in range(30):
@@ -1183,14 +1274,25 @@ class MeetingRecorderGUI:
                 if not ready or blocking:
                     break
                 acc = np.zeros(MIX_BYTES // 2, dtype=np.float32)
+                by_role = {}
                 for i in ready:
                     chunk = np.frombuffer(bytes(bufs[i][:MIX_BYTES]),
                         dtype=np.int16).astype(np.float32)
                     acc += chunk
+                    if role_of[i] is not None:
+                        by_role.setdefault(role_of[i], []).append(chunk)
                     del bufs[i][:MIX_BYTES]
                 acc *= (1.0 / len(ready))    # average-mix: amplitude stays ≤1.0 as sources grow
                 np.clip(acc, -32768, 32767, out=acc)
-                _emit(acc.astype(np.int16).tobytes())
+                # Each role track averages over its OWN sources only — dividing
+                # by the global count would quietly halve one speaker's volume.
+                role_chunks = {}
+                for role, chunks in by_role.items():
+                    racc = np.sum(chunks, axis=0)
+                    racc *= (1.0 / len(chunks))
+                    np.clip(racc, -32768, 32767, out=racc)
+                    role_chunks[role] = racc.astype(np.int16).tobytes()
+                _emit(acc.astype(np.int16).tobytes(), role_chunks)
 
             # Overflow fallback: one source bloated while others lag → emit solo
             for i in live:
@@ -1199,8 +1301,7 @@ class MeetingRecorderGUI:
                     for k in range(N) if k != i and not eof[k])
                 if others_short and len(bufs[i]) > OVERFLOW:
                     while len(bufs[i]) >= MIX_BYTES:
-                        _emit(bytes(bufs[i][:MIX_BYTES]))
-                        del bufs[i][:MIX_BYTES]
+                        _emit(*_solo(i))
 
             # Keep the timeline honest. With only idle loopback devices selected
             # nothing arrives at all, and the MP3 would end up shorter than the
@@ -1240,7 +1341,8 @@ class MeetingRecorderGUI:
         for i in range(N):
             usable = len(bufs[i]) - (len(bufs[i]) % FRAME_BYTES)
             if usable:
-                _emit(bytes(bufs[i][:usable]))
+                raw = bytes(bufs[i][:usable])
+                _emit(raw, {role_of[i]: raw} if role_of[i] else None)
 
     @staticmethod
     def _qget(q, timeout=0.05):
