@@ -85,17 +85,19 @@ python main.py --post-process "<会議フォルダのパス>"
 ### 録画済み動画から生成する
 
 1. **🎬 動画から生成**を押す
-2. MP4 / MOV / MKV / WebM / AVI などの動画ファイルを選ぶ
-3. ffmpeg が動画の音声を抽出し、そのまま文字起こしと議事録生成を実行します
+2. 必要に応じて **「動画入力時、画面変化を画像として保存・議事録に表示」** を切り替える
+3. MP4 / MOV / MKV / WebM / AVI などの動画ファイルを選ぶ
+4. ffmpeg が動画の音声を抽出し、そのまま文字起こしと議事録生成を実行します
 
 元動画は移動・変更されません。プロジェクト直下に動画名を付けた取込フォルダが作られ、
-`audio_main.mp3`、`metadata.txt`、議事録ファイルが保存されます。動画が単一音声トラックのため、
-録音時のマイク／スピーカー別の話者タグや画面キャプチャは付きません。
+`audio_main.mp3`、`metadata.txt`、議事録ファイルが保存されます。画像保存を有効にすると、
+動画を5秒間隔で確認し、画面が変化したフレームを画像として議事録へ挿入します。
+動画が単一音声トラックのため、録音時のマイク／スピーカー別の話者タグは付きません。
 
 CLIから実行する場合:
 
 ```powershell
-pipenv run python main.py --import-video "D:\Videos\meeting.mp4"
+pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapshots
 ```
 
 ---

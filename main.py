@@ -517,6 +517,12 @@ class MeetingRecorderGUI:
             command=self._cancel_postprocess, state="disabled")
         self.btn_cancel_post.pack(side="right", padx=(6, 0))
 
+        self.var_video_snapshots = tk.BooleanVar(value=True)
+        self.chk_video_snapshots = ttk.Checkbutton(
+            frame_ctrl, text="動画入力時、画面変化を画像として保存・議事録に表示",
+            variable=self.var_video_snapshots)
+        self.chk_video_snapshots.pack(anchor="w", pady=(3, 0))
+
         row_prog = ttk.Frame(frame_ctrl)
         row_prog.pack(fill="x", pady=(4, 0))
         self.progress_post = ttk.Progressbar(row_prog, maximum=1000, value=0)
@@ -826,6 +832,7 @@ class MeetingRecorderGUI:
             return
 
         lang = LANG_OPTIONS[self.combo_lang.current()][1]
+        capture_scenes = self.var_video_snapshots.get()
         self._post_running = True
         self._post_cancel.clear()
         self.btn_postprocess.config(state="disabled")
@@ -834,14 +841,18 @@ class MeetingRecorderGUI:
         self.progress_post.config(value=0)
         self.label_status.config(text="ステータス: 動画を取込中...", foreground="#8b5cf6")
         threading.Thread(target=self._video_import_worker,
-                         args=(video_path, lang), daemon=True).start()
+                         args=(video_path, lang, capture_scenes), daemon=True).start()
 
-    def _video_import_worker(self, video_path, lang):
+    def _video_import_worker(self, video_path, lang, capture_scenes):
         result = "失敗"
         try:
             folder = import_video_file(
                 video_path, language=lang, progress=self._post_progress,
-                cancel=self._post_cancel.is_set)
+                cancel=self._post_cancel.is_set, capture_scenes=capture_scenes,
+                scene_interval=self.INTERVAL,
+                scene_threshold=self.DHASH_THRESHOLD,
+                max_edge=self.CAPTURE_MAX_EDGE,
+                jpeg_quality=self.JPEG_QUALITY)
             self._last_record_dir = folder
             post_process_folder(folder, progress=self._post_progress,
                                 cancel=self._post_cancel.is_set)
@@ -3772,7 +3783,76 @@ def summarize_meeting(data, report):
 
 # --------------------------------------------------------------- Entry point
 
-def import_video_file(video_path, language="auto", progress=None, cancel=None):
+def _extract_video_snapshots(video_path, folder, interval=5.0, threshold=10,
+                             max_edge=1600, jpeg_quality=85,
+                             progress=None, cancel=None):
+    """Sample a video and keep frames whose dHash changed significantly."""
+    frame_dir = os.path.join(folder, ".video_frames")
+    os.makedirs(frame_dir)
+    pattern = os.path.join(frame_dir, "frame_%06d.jpg")
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    args = [
+        FFMPEG_PATH, "-y", "-loglevel", "error", "-i", video_path,
+        "-vf", f"fps=1/{max(0.1, float(interval))}", "-q:v", "3", pattern,
+    ]
+    proc = subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        creationflags=flags)
+    while proc.poll() is None:
+        if cancel is not None and cancel():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            raise PostProcessCancelled()
+        time.sleep(0.2)
+    stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        detail = stderr.splitlines()[-1] if stderr else "フレーム抽出に失敗しました"
+        raise RuntimeError(f"動画の画像を抽出できませんでした: {detail}")
+
+    frames = sorted(os.path.join(frame_dir, name) for name in os.listdir(frame_dir)
+                    if name.lower().endswith(".jpg"))
+    kept = []
+    last_hash = None
+    try:
+        for index, source in enumerate(frames):
+            if cancel is not None and cancel():
+                raise PostProcessCancelled()
+            with Image.open(source) as opened:
+                image = opened.convert("RGB")
+                current_hash = imagehash.dhash(image)
+                diff = 0 if last_hash is None else int(current_hash - last_hash)
+                if last_hash is not None and diff <= threshold:
+                    continue
+                last_hash = current_hash
+                if max_edge and max(image.size) > max_edge:
+                    scale = max_edge / max(image.size)
+                    image = image.resize(
+                        (max(1, round(image.width * scale)),
+                         max(1, round(image.height * scale))), Image.LANCZOS)
+                elapsed = index * float(interval)
+                filename = f"snapshot_video_{round(elapsed * 1000):09d}.jpg"
+                image.save(os.path.join(folder, filename), "JPEG", quality=jpeg_quality)
+            kept.append({
+                "file": filename, "elapsed": round(elapsed, 3),
+                "type": "video", "diff": diff,
+            })
+            if progress is not None and len(kept) % 10 == 0:
+                progress(None, f"動画の画面変化を抽出中: {len(kept)}枚保存")
+        if kept:
+            with open(os.path.join(folder, "snapshots.jsonl"), "w", encoding="utf-8") as f:
+                for entry in kept:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+    return len(kept)
+
+
+def import_video_file(video_path, language="auto", progress=None, cancel=None,
+                      capture_scenes=False, scene_interval=5.0,
+                      scene_threshold=10, max_edge=1600, jpeg_quality=85):
     """Create a meeting folder from a video without modifying the source file.
 
     The video stream itself is not copied. ffmpeg extracts a standard
@@ -3820,13 +3900,22 @@ def import_video_file(video_path, language="auto", progress=None, cancel=None):
         if cancel is not None and cancel():
             raise PostProcessCancelled()
 
+        snapshot_count = 0
+        if capture_scenes:
+            _progress(0.02, "動画の画面変化を検出中...")
+            snapshot_count = _extract_video_snapshots(
+                video_path, folder, interval=scene_interval,
+                threshold=scene_threshold, max_edge=max_edge,
+                jpeg_quality=jpeg_quality, progress=progress, cancel=cancel)
+            _progress(0.03, f"動画から画像を保存しました: {snapshot_count}枚")
+
         with open(os.path.join(folder, "metadata.txt"), "w", encoding="utf-8") as f:
             f.write(f"MEETING_NAME={stem}\n")
             f.write(f"START_TIME_EPOCH={now.timestamp()}\n")
             f.write(f"START_TIME_STR={now.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("AUDIO_SOURCE=動画ファイル\n")
             f.write("MODE=video_import\n")
-            f.write("SNAPSHOT_COUNT=0\n")
+            f.write(f"SNAPSHOT_COUNT={snapshot_count}\n")
             f.write("MARKER_COUNT=0\n")
             f.write("AUDIO_FILE=audio_main.mp3\n")
             f.write(f"LANGUAGE={language}\n")
@@ -3903,11 +3992,14 @@ if __name__ == "__main__":
         help="指定フォルダの音声を高精度文字起こしし、スクリーンショットと統合したMarkdownを出力")
     parser.add_argument("--import-video", metavar="VIDEO",
         help="動画から音声を抽出し、文字起こしと議事録を生成")
+    parser.add_argument("--video-snapshots", action="store_true",
+        help="動画入力時に画面変化を画像として保存し、議事録に表示")
     args = parser.parse_args()
 
     if args.import_video:
         try:
-            imported_folder = import_video_file(args.import_video)
+            imported_folder = import_video_file(
+                args.import_video, capture_scenes=args.video_snapshots)
             post_process_folder(imported_folder)
             print(f"  - 保存先: {imported_folder}")
         except Exception as e:
