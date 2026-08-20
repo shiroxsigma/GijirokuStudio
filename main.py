@@ -506,6 +506,11 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=6,
             command=self._run_postprocess)
         self.btn_postprocess.pack(side="left", fill="x", expand=True)
+        self.btn_import_video = tk.Button(
+            row_post, text="🎬 動画から生成", bg="#8b5cf6", fg="white",
+            font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=6,
+            command=self._run_video_import)
+        self.btn_import_video.pack(side="left", padx=(6, 0))
         self.btn_cancel_post = tk.Button(
             row_post, text="✖ 中断", bg="#ef4444", fg="white",
             font=("BIZ UDゴシック", 10, "bold"), relief="raised", padx=10, pady=6,
@@ -796,10 +801,60 @@ class MeetingRecorderGUI:
         self._post_running = True
         self._post_cancel.clear()
         self.btn_postprocess.config(state="disabled", text="⏳ 処理中...")
+        self.btn_import_video.config(state="disabled")
         self.btn_cancel_post.config(state="normal", text="✖ 中断")
         self.progress_post.config(value=0)
         self.label_status.config(text="ステータス: 議事録生成中...", foreground="#f59e0b")
         threading.Thread(target=self._postprocess_worker, args=(folder,), daemon=True).start()
+
+    def _run_video_import(self):
+        """Select a video, extract its audio, then run the normal post-process."""
+        if self._post_running:
+            messagebox.showinfo("実行中", "後処理がすでに実行中です。")
+            return
+        video_path = filedialog.askopenfilename(
+            title="議事録を生成する動画を選択",
+            filetypes=[
+                ("動画ファイル", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.mts *.m2ts"),
+                ("すべてのファイル", "*.*"),
+            ])
+        if not video_path:
+            return
+        if not os.path.exists(FFMPEG_PATH):
+            messagebox.showerror("ffmpegが見つかりません",
+                f"動画の音声抽出にffmpeg.exeが必要です。\n\n期待パス:\n{FFMPEG_PATH}")
+            return
+
+        lang = LANG_OPTIONS[self.combo_lang.current()][1]
+        self._post_running = True
+        self._post_cancel.clear()
+        self.btn_postprocess.config(state="disabled")
+        self.btn_import_video.config(state="disabled", text="⏳ 取込中...")
+        self.btn_cancel_post.config(state="normal", text="✖ 中断")
+        self.progress_post.config(value=0)
+        self.label_status.config(text="ステータス: 動画を取込中...", foreground="#8b5cf6")
+        threading.Thread(target=self._video_import_worker,
+                         args=(video_path, lang), daemon=True).start()
+
+    def _video_import_worker(self, video_path, lang):
+        result = "失敗"
+        try:
+            folder = import_video_file(
+                video_path, language=lang, progress=self._post_progress,
+                cancel=self._post_cancel.is_set)
+            self._last_record_dir = folder
+            post_process_folder(folder, progress=self._post_progress,
+                                cancel=self._post_cancel.is_set)
+            result = "成功"
+        except PostProcessCancelled:
+            result = "中断"
+        except Exception as e:
+            self.root.after(0, self._log, f"[動画取込エラー] {e}")
+            traceback.print_exc()
+        finally:
+            self._post_running = False
+            self.root.after(0, self._log, f"動画からの議事録生成完了 ({result})")
+            self.root.after(0, self._finish_postprocess_ui, result)
 
     def _cancel_postprocess(self):
         """Ask the worker to stop; it checks the flag at each phase boundary."""
@@ -836,6 +891,7 @@ class MeetingRecorderGUI:
 
     def _finish_postprocess_ui(self, result):
         self.btn_postprocess.config(state="normal", text="📄 議事録を生成（後処理）")
+        self.btn_import_video.config(state="normal", text="🎬 動画から生成")
         self.btn_cancel_post.config(state="disabled", text="✖ 中断")
         self.label_progress.config(text="" if result == "成功" else result)
         if result != "成功":
@@ -3716,6 +3772,73 @@ def summarize_meeting(data, report):
 
 # --------------------------------------------------------------- Entry point
 
+def import_video_file(video_path, language="auto", progress=None, cancel=None):
+    """Create a meeting folder from a video without modifying the source file.
+
+    The video stream itself is not copied. ffmpeg extracts a standard
+    ``audio_main.mp3`` so the existing transcription and report pipeline can be
+    reused without special cases in renderers.
+    """
+    video_path = os.path.abspath(video_path)
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"動画ファイルが見つかりません: {video_path}")
+    if not os.path.isfile(FFMPEG_PATH):
+        raise FileNotFoundError(f"ffmpeg.exe が見つかりません: {FFMPEG_PATH}")
+    if cancel is not None and cancel():
+        raise PostProcessCancelled()
+
+    def _progress(frac, message):
+        print(message)
+        if progress is not None:
+            progress(frac, message)
+
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    safe = MeetingRecorderGUI._sanitize_name(stem) or "Video"
+    now = datetime.datetime.now()
+    base_name = f"{now.strftime('%Y%m%d_%H%M%S')}_{safe}"
+    folder = os.path.join(BASE_DIR, base_name)
+    suffix = 2
+    while os.path.exists(folder):
+        folder = os.path.join(BASE_DIR, f"{base_name}_{suffix}")
+        suffix += 1
+    os.makedirs(folder)
+
+    audio_path = os.path.join(folder, "audio_main.mp3")
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    _progress(0.0, f"動画を読み込み中: {os.path.basename(video_path)}")
+    try:
+        completed = subprocess.run(
+            [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-map", "0:a:0",
+             "-c:a", "libmp3lame", "-b:a", "192k", audio_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=flags)
+        if completed.returncode != 0 or not os.path.exists(audio_path) \
+                or os.path.getsize(audio_path) == 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            detail = detail.splitlines()[-1] if detail else "音声トラックがありません"
+            raise RuntimeError(f"動画から音声を抽出できませんでした: {detail}")
+        if cancel is not None and cancel():
+            raise PostProcessCancelled()
+
+        with open(os.path.join(folder, "metadata.txt"), "w", encoding="utf-8") as f:
+            f.write(f"MEETING_NAME={stem}\n")
+            f.write(f"START_TIME_EPOCH={now.timestamp()}\n")
+            f.write(f"START_TIME_STR={now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("AUDIO_SOURCE=動画ファイル\n")
+            f.write("MODE=video_import\n")
+            f.write("SNAPSHOT_COUNT=0\n")
+            f.write("MARKER_COUNT=0\n")
+            f.write("AUDIO_FILE=audio_main.mp3\n")
+            f.write(f"LANGUAGE={language}\n")
+            f.write(f"SOURCE_VIDEO={video_path}\n")
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+    _progress(0.03, f"動画の音声抽出完了: {os.path.basename(audio_path)}")
+    return folder
+
+
 def post_process_folder(folder, progress=None, cancel=None):
     """Transcribe a meeting folder and generate the report files.
 
@@ -3778,9 +3901,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GijirokuStudio v2")
     parser.add_argument("--post-process", metavar="FOLDER",
         help="指定フォルダの音声を高精度文字起こしし、スクリーンショットと統合したMarkdownを出力")
+    parser.add_argument("--import-video", metavar="VIDEO",
+        help="動画から音声を抽出し、文字起こしと議事録を生成")
     args = parser.parse_args()
 
-    if args.post_process:
+    if args.import_video:
+        try:
+            imported_folder = import_video_file(args.import_video)
+            post_process_folder(imported_folder)
+            print(f"  - 保存先: {imported_folder}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
+    elif args.post_process:
         try:
             post_process_folder(args.post_process)
         except Exception as e:
