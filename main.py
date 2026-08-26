@@ -279,6 +279,9 @@ class MeetingRecorderGUI:
         self._audio_devices = []        # list of enumerated device dicts
         self._audio_queues = []         # per-device capture queues (during recording)
         self.transcribe_queue = None
+        self.transcribe_role_queues = {}
+        self._asr_load_ema = 0.0
+        self._asr_load_level = 0
         # PortAudio init/open/terminate are not thread-safe: with several devices
         # starting at once, unrelated opens fail with bogus "invalid sample rate".
         self._open_lock = threading.Lock()
@@ -790,8 +793,10 @@ class MeetingRecorderGUI:
                     self.root.after(0, self._log,
                         "高速日本語/英語モデルを事前読み込み中...")
                     model_dir = os.path.join(BASE_DIR, "models", "fast_ja_en")
+                    hotwords, replacements = self._prepare_fast_glossary(model_dir)
                     self._preloaded_transcriber = FastJapaneseEnglishASR(
-                        model_dir, threads=self.FAST_ASR_THREADS)
+                        model_dir, threads=self.FAST_ASR_THREADS,
+                        hotwords_file=hotwords, replacements=replacements)
                     self.root.after(0, self._log, "高速日本語/英語モデル読み込み完了")
                 else:
                     from faster_whisper import WhisperModel
@@ -805,6 +810,30 @@ class MeetingRecorderGUI:
             except Exception as e:
                 self.root.after(0, self._log, f"[事前読み込みエラー] {e}")
         threading.Thread(target=_load, daemon=True).start()
+
+    @staticmethod
+    def _prepare_fast_glossary(model_dir):
+        terms = load_glossary()
+        replacements = {}
+        forms = []
+        for term in terms:
+            form = term.get("form", "").strip()
+            if not form:
+                continue
+            forms.append(form)
+            for alias in term.get("aliases", []):
+                if alias and alias != form:
+                    replacements[alias] = form
+        path = os.path.join(model_dir, "gijiroku_hotwords.txt")
+        os.makedirs(model_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(forms))
+        # This ReazonSpeech export uses byte-BPE tokens, so sherpa-onnx cannot
+        # encode ordinary Japanese CJK hotword lines for modified beam search.
+        # Keep the generated list for inspection/future model upgrades, while
+        # applying the glossary aliases deterministically after every draft,
+        # final, and refine decode (which works for both ja and en).
+        return "", replacements
 
     def _on_lang_changed(self, _=None):
         label = LANG_OPTIONS[self.combo_lang.current()][0]
@@ -1627,29 +1656,44 @@ class MeetingRecorderGUI:
         self.log_area.see(tk.END)
         self.log_area.config(state="disabled")
 
-    def _log_transcript(self, text):
-        self.transcript_area.config(state="normal")
-        ranges = self.transcript_area.tag_ranges("partial")
+    def _clear_partial_transcript(self, speaker=""):
+        tag = "partial_" + (speaker or "mixed")
+        ranges = self.transcript_area.tag_ranges(tag)
         for start, end in zip(ranges[0::2], ranges[1::2]):
             self.transcript_area.delete(start, end)
+
+    def _log_transcript(self, text, speaker=""):
+        self.transcript_area.config(state="normal")
+        self._clear_partial_transcript(speaker)
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        self.transcript_area.insert(tk.END, f"[{ts}] {text}\n")
+        who = f" [{speaker}]" if speaker else ""
+        self.transcript_area.insert(tk.END, f"[{ts}]{who} {text}\n")
         self.transcript_area.see(tk.END)
         self.transcript_area.config(state="disabled")
 
-    def _show_partial_transcript(self, text):
+    def _show_partial_transcript(self, text, stable="", speaker=""):
         self.transcript_area.config(state="normal")
-        ranges = self.transcript_area.tag_ranges("partial")
-        for start, end in zip(ranges[0::2], ranges[1::2]):
-            self.transcript_area.delete(start, end)
-        self.transcript_area.insert(tk.END, f"~ {text}\n", "partial")
-        self.transcript_area.tag_config("partial", foreground="#6b7280")
+        self._clear_partial_transcript(speaker)
+        tag = "partial_" + (speaker or "mixed")
+        who = f"[{speaker}] " if speaker else ""
+        self.transcript_area.insert(tk.END, f"~ {who}", tag)
+        if stable and text.startswith(stable):
+            self.transcript_area.insert(tk.END, stable, (tag, "partial_stable"))
+            self.transcript_area.insert(tk.END, text[len(stable):], (tag, "partial_variable"))
+        else:
+            self.transcript_area.insert(tk.END, text, (tag, "partial_variable"))
+        self.transcript_area.insert(tk.END, "\n", tag)
+        self.transcript_area.tag_config(tag)
+        self.transcript_area.tag_config("partial_stable", foreground="#111827",
+                                        font=("BIZ UDゴシック", 10, "bold"))
+        self.transcript_area.tag_config("partial_variable", foreground="#6b7280")
         self.transcript_area.see(tk.END)
         self.transcript_area.config(state="disabled")
 
-    def _log_refined_transcript(self, text):
+    def _log_refined_transcript(self, text, speaker=""):
         self.transcript_area.config(state="normal")
-        self.transcript_area.insert(tk.END, f"  ↳ 補正: {text}\n", "refine")
+        who = f" [{speaker}]" if speaker else ""
+        self.transcript_area.insert(tk.END, f"  ↳ 補正{who}: {text}\n", "refine")
         self.transcript_area.tag_config("refine", foreground="#2563eb")
         self.transcript_area.see(tk.END)
         self.transcript_area.config(state="disabled")
@@ -1771,13 +1815,21 @@ class MeetingRecorderGUI:
 
         # One dedicated queue per selected device
         self._audio_queues = [queue.Queue(maxsize=200) for _ in range(n)]
-        self.transcribe_queue = queue.Queue(maxsize=400) if mode_full else None
+        self.transcribe_queue = None
+        self.transcribe_role_queues = {}
 
         # Speaker separation needs both sides captured; with one side there is
         # nothing to separate and the role tracks would just duplicate the mix.
         n_mic = sum(1 for d in selected if d["kind"] == "mic")
         n_spk = sum(1 for d in selected if d["kind"] == "speaker")
         separate = n > 1 and n_mic >= 1 and n_spk >= 1
+        if mode_full and self.REALTIME_BACKEND == "fast_ja_en" and separate:
+            self.transcribe_role_queues = {
+                ROLE_SELF: queue.Queue(maxsize=400),
+                ROLE_OTHER: queue.Queue(maxsize=400),
+            }
+        elif mode_full:
+            self.transcribe_queue = queue.Queue(maxsize=400)
 
         if not self._start_writers(dir_name, out_mp3, separate):
             self.root.after(0, self._log, "[エラー] ffmpeg 起動失敗")
@@ -1857,6 +1909,7 @@ class MeetingRecorderGUI:
             'audio_src_str': self._audio_source_label_n(selected),
             'snap_count': snap_count, 'lang': lang,
             'realtime_backend': self.REALTIME_BACKEND,
+            'realtime_roles': bool(self.transcribe_role_queues),
             'meeting_name': self._meeting_name,
             'role_tracks': sorted(self._role_writers),
         }
@@ -1904,6 +1957,7 @@ class MeetingRecorderGUI:
             if ctx['mode_full']:
                 f.write("TRANSCRIPTION_FILE=transcription.txt\n")
                 f.write(f"REALTIME_BACKEND={ctx['realtime_backend']}\n")
+                f.write(f"REALTIME_ROLE_SEPARATION={'true' if ctx['realtime_roles'] else 'false'}\n")
                 if ctx['realtime_backend'] == "fast_ja_en":
                     f.write("REFINED_TRANSCRIPTION_FILE=transcription_refined.txt\n")
                     f.write("FINAL_TRANSCRIPTION_FILE=transcription_final.txt\n")
@@ -2021,8 +2075,21 @@ class MeetingRecorderGUI:
 
     # ------------------------------------------------- Transcribe forwarding
 
-    def _push_transcribe(self, pcm):
+    def _push_transcribe(self, pcm, role_chunks=None):
         """Forward a PCM chunk to the transcription queue (no-op in light mode)."""
+        if self.transcribe_role_queues:
+            silence = None
+            for role, q in self.transcribe_role_queues.items():
+                chunk = role_chunks.get(role) if role_chunks else None
+                if chunk is None:
+                    if silence is None:
+                        silence = bytes(len(pcm))
+                    chunk = silence
+                try:
+                    q.put_nowait(chunk)
+                except queue.Full:
+                    self._queue_overflow_count += 1
+            return
         if self.transcribe_queue is not None:
             try:
                 self.transcribe_queue.put_nowait(pcm)
@@ -2092,7 +2159,7 @@ class MeetingRecorderGUI:
             emitted += len(raw)
             self._update_level(raw)
             self._write_audio(raw, role_chunks)
-            self._push_transcribe(raw)
+            self._push_transcribe(raw, role_chunks)
 
         def _solo(i):
             """A single source's chunk, tagged with its role for the role track."""
@@ -2401,9 +2468,11 @@ class MeetingRecorderGUI:
                 if self.REALTIME_BACKEND == "fast_ja_en":
                     from fast_asr import FastJapaneseEnglishASR
                     self.root.after(0, self._log, "高速日本語/英語モデルを読み込み中...")
+                    model_dir = os.path.join(BASE_DIR, "models", "fast_ja_en")
+                    hotwords, replacements = self._prepare_fast_glossary(model_dir)
                     self.transcriber = FastJapaneseEnglishASR(
-                        os.path.join(BASE_DIR, "models", "fast_ja_en"),
-                        threads=self.FAST_ASR_THREADS)
+                        model_dir, threads=self.FAST_ASR_THREADS,
+                        hotwords_file=hotwords, replacements=replacements)
                 else:
                     from faster_whisper import WhisperModel
                     self.root.after(0, self._log,
@@ -2417,6 +2486,16 @@ class MeetingRecorderGUI:
             self._rt_detected_lang = None
             self._fast_final_segments = []
             self._fast_refined_segments = []
+            self._asr_load_ema = 0.0
+            self._asr_load_level = 0
+            if self.REALTIME_BACKEND == "fast_ja_en" and self.transcribe_role_queues:
+                base = self.transcriber
+                self.transcriber = {
+                    ROLE_SELF: base,
+                    ROLE_OTHER: base.clone_session(),
+                }
+                self.root.after(0, self._log,
+                    "リアルタイム話者分離: 自分 / 相手を別々に認識")
 
             self.transcription_file = open(
                 os.path.join(dir_name, "transcription.txt"), "w", encoding="utf-8")
@@ -2435,27 +2514,32 @@ class MeetingRecorderGUI:
             self.root.after(0, self._log, f"[文字起こしエラー] {e}")
             self.transcriber = None
 
-    def _record_fast_results(self, events):
+    def _record_fast_results(self, events, speaker=""):
         for result in events:
+            result.speaker = speaker
             text = result.text.strip()
             if not text:
                 continue
             if result.kind == "partial":
-                self.root.after(0, self._show_partial_transcript, text)
+                self.root.after(0, self._show_partial_transcript,
+                                text, result.stable_text, speaker)
                 continue
             if result.kind == "refine":
                 self._fast_refined_segments.append(result)
-                self.root.after(0, self._log_refined_transcript, text)
+                self.root.after(0, self._log_refined_transcript, text, speaker)
                 if self.refined_transcription_file:
                     elapsed = time.time() - self._transcribe_start
-                    self.refined_transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
+                    who = f"[{speaker}] " if speaker else ""
+                    self.refined_transcription_file.write(
+                        f"[{elapsed:.1f}s] {who}{text}\n")
                     self.refined_transcription_file.flush()
                 continue
             self._fast_final_segments.append(result)
-            self.root.after(0, self._log_transcript, text)
+            self.root.after(0, self._log_transcript, text, speaker)
             if self.transcription_file:
                 elapsed = time.time() - self._transcribe_start
-                self.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
+                who = f"[{speaker}] " if speaker else ""
+                self.transcription_file.write(f"[{elapsed:.1f}s] {who}{text}\n")
                 self.transcription_file.flush()
             if (self._rt_lang is None and result.language
                     and result.language != self._rt_detected_lang):
@@ -2463,30 +2547,69 @@ class MeetingRecorderGUI:
                 label = "日本語" if result.language == "ja" else "English"
                 self._write_language_event(result.language, label)
 
+    def _update_asr_load(self, ratio, sessions):
+        """Adapt draft frequency with hysteresis; finals are never disabled."""
+        self._asr_load_ema = (ratio if self._asr_load_ema == 0
+                              else self._asr_load_ema * 0.85 + ratio * 0.15)
+        old = self._asr_load_level
+        if self._asr_load_level == 0 and self._asr_load_ema > 0.55:
+            self._asr_load_level = 1
+        elif self._asr_load_level == 1:
+            if self._asr_load_ema > 0.90:
+                self._asr_load_level = 2
+            elif self._asr_load_ema < 0.40:
+                self._asr_load_level = 0
+        elif self._asr_load_level == 2 and self._asr_load_ema < 0.70:
+            self._asr_load_level = 1
+        for session in sessions.values():
+            session.partials_enabled = self._asr_load_level < 2
+            session.partial_every = 1.0 if self._asr_load_level == 1 else 0.5
+        if old != self._asr_load_level:
+            labels = ("通常（暫定0.5秒）", "負荷軽減（暫定1秒）", "高負荷（確定のみ）")
+            self.root.after(0, self._log,
+                f"ASR負荷調整: {labels[self._asr_load_level]} "
+                f"(RTF={self._asr_load_ema:.2f})")
+
     def _transcribe_fast_loop(self):
-        """Feed mixed PCM continuously to the ja/en Zipformer VAD pipeline."""
+        """Feed mixed or role-separated PCM with adaptive partial decoding."""
         from scipy.signal import resample_poly
 
-        while self.is_recording and not self.stop_event.is_set():
-            if self.transcribe_queue is None or self.transcriber is None:
-                time.sleep(0.05)
-                continue
-            try:
-                pcm = self.transcribe_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
-                mono_16k = resample_poly(
-                    mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
-                self._record_fast_results(self.transcriber.accept(mono_16k, self._rt_lang))
-            except Exception as e:
-                self.root.after(0, self._log, f"[高速文字起こし処理エラー] {e}")
+        if isinstance(self.transcriber, dict):
+            sessions = self.transcriber
+            queues = self.transcribe_role_queues
+        else:
+            sessions = {"": self.transcriber}
+            queues = {"": self.transcribe_queue}
 
-        if self.transcriber is not None:
+        while self.is_recording and not self.stop_event.is_set():
+            got = False
+            for speaker, q in queues.items():
+                if q is None:
+                    continue
+                try:
+                    pcm = q.get_nowait()
+                except queue.Empty:
+                    continue
+                got = True
+                try:
+                    t0 = time.perf_counter()
+                    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
+                    mono_16k = resample_poly(
+                        mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
+                    self._record_fast_results(
+                        sessions[speaker].accept(mono_16k, self._rt_lang), speaker)
+                    audio_s = max(len(mono) / self.TARGET_RATE, 0.001)
+                    self._update_asr_load(
+                        (time.perf_counter() - t0) / audio_s, sessions)
+                except Exception as e:
+                    self.root.after(0, self._log, f"[高速文字起こし処理エラー] {e}")
+            if not got:
+                time.sleep(0.02)
+
+        for speaker, session in sessions.items():
             try:
-                self._record_fast_results(self.transcriber.flush(self._rt_lang))
+                self._record_fast_results(session.flush(self._rt_lang), speaker)
             except Exception as e:
                 self.root.after(0, self._log, f"[高速文字起こし終了警告] {e}")
 
@@ -2588,7 +2711,8 @@ class MeetingRecorderGUI:
         rows = []
         for event in self._fast_final_segments:
             covered = any(
-                event.start_sample < refined.end_sample
+                event.speaker == refined.speaker
+                and event.start_sample < refined.end_sample
                 and event.end_sample > refined.start_sample
                 for refined in refinements)
             if not covered:
@@ -2602,7 +2726,9 @@ class MeetingRecorderGUI:
         with open(txt_path, "w", encoding="utf-8") as f:
             for event in rows:
                 seconds = event.start_sample / self.TRANSCRIBE_RATE
-                f.write(f"[{fmt_timestamp(seconds)}] [{event.language}] {event.text.strip()}\n")
+                who = f" [{event.speaker}]" if event.speaker else ""
+                f.write(f"[{fmt_timestamp(seconds)}]{who} [{event.language}] "
+                        f"{event.text.strip()}\n")
 
         audio_name = "audio_main.mp3"
         items = []
@@ -2614,7 +2740,9 @@ class MeetingRecorderGUI:
                 '<span class="lang">{lang}</span>'
                 '<span class="text">{text}</span></div>'.format(
                     time=seconds, stamp=fmt_timestamp(seconds),
-                    lang=html.escape(event.language), text=html.escape(event.text.strip())))
+                    lang=html.escape(
+                        f"{event.speaker}/{event.language}" if event.speaker
+                        else event.language), text=html.escape(event.text.strip())))
         title = html.escape(self._meeting_name or "文字起こし（補正済み）")
         html_path = os.path.join(self._recording_dir, "transcription_final.html")
         document = f"""<!doctype html>
@@ -2655,6 +2783,7 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
             self.refined_transcription_file.close()
             self.refined_transcription_file = None
         self.transcribe_queue = None
+        self.transcribe_role_queues = {}
 
 
 # ======================================================================

@@ -24,6 +24,8 @@ class FastASREvent:
     language: str
     start_sample: int = 0
     end_sample: int = 0
+    speaker: str = ""
+    stable_text: str = ""
 
 
 class FastJapaneseEnglishASR:
@@ -35,7 +37,8 @@ class FastJapaneseEnglishASR:
     refine_max = 25.0
 
     def __init__(self, models_dir: str, threads: int = 4,
-                 min_silence: float = 0.35, max_speech: float = 12.0):
+                 min_silence: float = 0.35, max_speech: float = 12.0,
+                 hotwords_file: str = "", replacements: dict | None = None):
         try:
             import sherpa_onnx
         except ImportError as exc:
@@ -43,6 +46,8 @@ class FastJapaneseEnglishASR:
         self.sherpa = sherpa_onnx
         self.models_dir = models_dir
         self.threads = max(1, int(threads))
+        self.hotwords_file = hotwords_file
+        self.replacements = replacements or {}
         self.reazon = self._build_reazon()
         self.parakeet = self._build_parakeet()
         self.lid = self._build_lid()
@@ -50,14 +55,27 @@ class FastJapaneseEnglishASR:
         self.punctuator = JapanesePunctuator(
             os.path.join(models_dir, "mojicast-punct-onnx"), self.threads)
 
-        vad_path = self._required(os.path.join(models_dir, "silero_vad.onnx"), "VAD")
-        cfg = sherpa_onnx.VadModelConfig(
-            silero_vad=sherpa_onnx.SileroVadModelConfig(
-                model=vad_path, min_silence_duration=min_silence,
+        self._min_silence = min_silence
+        self._max_speech = max_speech
+        self._init_session()
+
+        silence = np.zeros(self.sample_rate, dtype=np.float32)
+        self._identify(silence)
+        self._decode(self.reazon, silence, "ja", punctuate=False)
+        self._decode(self.parakeet, silence, "en", punctuate=False)
+
+    def _make_vad(self):
+        vad_path = self._required(os.path.join(self.models_dir, "silero_vad.onnx"), "VAD")
+        cfg = self.sherpa.VadModelConfig(
+            silero_vad=self.sherpa.SileroVadModelConfig(
+                model=vad_path, min_silence_duration=self._min_silence,
                 min_speech_duration=0.25, window_size=self.window_size,
-                max_speech_duration=max_speech),
+                max_speech_duration=self._max_speech),
             sample_rate=self.sample_rate, num_threads=1)
-        self.vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
+        return self.sherpa.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
+
+    def _init_session(self):
+        self.vad = self._make_vad()
         self._pending = np.zeros(0, dtype=np.float32)
         self._history = np.zeros(0, dtype=np.float32)
         self._history_offset = 0
@@ -66,11 +84,21 @@ class FastJapaneseEnglishASR:
         self._early_lang = None
         self._group = []
         self._last_lang = None
+        self._pending_lang = None
+        self._pending_lang_count = 0
+        self._partial_prev = ""
+        self._partial_stable = ""
+        self.partials_enabled = True
 
-        silence = np.zeros(self.sample_rate, dtype=np.float32)
-        self._identify(silence)
-        self._decode(self.reazon, silence, "ja", punctuate=False)
-        self._decode(self.parakeet, silence, "en", punctuate=False)
+    def clone_session(self):
+        """New independent VAD/timeline sharing the heavy recognizers."""
+        other = self.__class__.__new__(self.__class__)
+        for name in ("sherpa", "models_dir", "threads", "hotwords_file",
+                     "replacements", "reazon", "parakeet", "lid", "punctuator",
+                     "_min_silence", "_max_speech"):
+            setattr(other, name, getattr(self, name))
+        other._init_session()
+        return other
 
     @staticmethod
     def _find(folder: str, pattern: str) -> str:
@@ -91,7 +119,8 @@ class FastJapaneseEnglishASR:
             joiner=self._required(self._find(folder, "joiner-*.int8.onnx"), "日本語joiner"),
             tokens=self._required(os.path.join(folder, "tokens.txt"), "日本語tokens"),
             num_threads=self.threads, decoding_method="modified_beam_search",
-            modeling_unit="cjkchar")
+            modeling_unit="cjkchar", hotwords_file=self.hotwords_file,
+            hotwords_score=2.0)
 
     def _build_parakeet(self):
         folder = os.path.join(self.models_dir, PARAKEET_DIR)
@@ -129,9 +158,52 @@ class FastJapaneseEnglishASR:
         stream.accept_waveform(self.sample_rate, samples)
         recognizer.decode_stream(stream)
         text = self._clean(stream.result.text)
+        for wrong, right in self.replacements.items():
+            text = text.replace(wrong, right)
         if text and lang == "ja" and punctuate:
             text = self.punctuator.restore(text)
         return text
+
+    @staticmethod
+    def _has_kana(text):
+        return any("\u3040" <= c <= "\u30ff" for c in text)
+
+    def _stable_language(self, detected, speech_seconds):
+        if self._last_lang is None:
+            return detected
+        if detected == self._last_lang:
+            self._pending_lang = None
+            self._pending_lang_count = 0
+            return detected
+        if speech_seconds < 2.0:
+            return self._last_lang
+        if detected == self._pending_lang:
+            self._pending_lang_count += 1
+        else:
+            self._pending_lang = detected
+            self._pending_lang_count = 1
+        if self._pending_lang_count < 2:
+            return self._last_lang
+        self._pending_lang = None
+        self._pending_lang_count = 0
+        return detected
+
+    @staticmethod
+    def _common_prefix(a, b):
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return a[:i]
+
+    def _partial_event(self, text, lang):
+        common = self._common_prefix(self._partial_prev, text)
+        if len(common) > len(self._partial_stable):
+            self._partial_stable = common
+        elif not text.startswith(self._partial_stable):
+            self._partial_stable = common
+        self._partial_prev = text
+        return FastASREvent("partial", text, lang, stable_text=self._partial_stable)
 
     def _decode_lang(self, samples, lang, punctuate=True):
         rec = self.parakeet if lang == "en" else self.reazon
@@ -185,12 +257,24 @@ class FastJapaneseEnglishASR:
             lang = lang_hint if lang_hint in ("ja", "en") else self._early_lang
             if lang not in ("ja", "en"):
                 lang = self._identify(samples)
+            lang = self._stable_language(lang, len(samples) / self.sample_rate)
             text = self._decode_lang(samples, lang)
+            # If the decoded script strongly contradicts LID, retry once with
+            # the other specialist before displaying anything.
+            if text and ((lang == "en" and self._has_kana(text))
+                         or (lang == "ja" and text.isascii()
+                             and any(c.isalpha() for c in text))):
+                other = "ja" if lang == "en" else "en"
+                retry = self._decode_lang(samples, other)
+                if retry:
+                    lang, text = other, retry
             if text:
                 out.append(FastASREvent("final", text, lang, start, end))
                 self._group.append((start, end, lang, text))
                 self._last_lang = lang
             self._early_lang = None
+            self._partial_prev = ""
+            self._partial_stable = ""
         return out
 
     def accept(self, samples: np.ndarray, lang_hint: str | None = None):
@@ -209,14 +293,15 @@ class FastJapaneseEnglishASR:
                 if lang_hint not in ("ja", "en") and self._early_lang is None \
                         and len(cur) >= 2 * self.sample_rate:
                     self._early_lang = self._identify(cur)
-                if (self._audio_pos - self._last_partial >= self.partial_every * self.sample_rate
+                if (self.partials_enabled
+                        and self._audio_pos - self._last_partial >= self.partial_every * self.sample_rate
                         and len(cur) >= self.sample_rate // 2):
                     self._last_partial = self._audio_pos
                     draft = cur[-int(self.partial_window * self.sample_rate):]
                     lang = lang_hint if lang_hint in ("ja", "en") else (self._early_lang or self._last_lang or "ja")
                     text = self._decode_lang(draft, lang, punctuate=False)
                     if text:
-                        events.append(FastASREvent("partial", text, lang))
+                        events.append(self._partial_event(text, lang))
             events.extend(self._drain(lang_hint))
             # Long narration may never contain a two-second pause. Refine a
             # bounded group as soon as finalized spans reach refine_max;
