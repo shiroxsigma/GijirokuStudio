@@ -15,6 +15,8 @@ scipy = "*"
 faster-whisper = "*"
 
 [optional]
+# 高速リアルタイム日本語/英語ASR（setup_fast_asr.py でも導入可能）
+sherpa-onnx = "==1.13.6"
 # AI要約で summary_provider="claude" を選ぶ場合のみ必要
 # （Ollama とローカル完結の利用時は不要）
 anthropic = "*"

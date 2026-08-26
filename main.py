@@ -39,6 +39,11 @@ SUMMARY_PROVIDERS = [
     ("Claude API（外部送信）", "claude"),
 ]
 
+REALTIME_BACKENDS = [
+    ("高速 日本語/英語（ReazonSpeech）", "fast_ja_en"),
+    ("従来（faster-whisper）", "whisper"),
+]
+
 LANG_OPTIONS = [
     ("自動（日本語/英語）", "auto"),
     ("日本語", "ja"), ("English", "en"), ("中文", "zh"), ("한국어", "ko"),
@@ -246,10 +251,15 @@ class MeetingRecorderGUI:
         self._role_writers = {}       # role -> _PcmWriter (speaker separation)
         self.transcriber = None
         self.transcription_file = None
+        self.refined_transcription_file = None
         self._transcribe_start = 0
         self._record_start = 0
         self._audio_level = 0.0
         self._preloaded_transcriber = None
+        self._transcribe_thread = None
+        self._rt_detected_lang = None
+        self._fast_final_segments = []
+        self._fast_refined_segments = []
         self._recording_dir = None
         self._recording_mon_idx = 0
         self._recording_rect = None   # frozen at record start, like the dHash threshold
@@ -291,6 +301,8 @@ class MeetingRecorderGUI:
 
         # faster-whisper (real-time) settings — smaller model for low latency
         self.REALTIME_WHISPER_MODEL = "base"
+        self.REALTIME_BACKEND = "fast_ja_en"
+        self.FAST_ASR_THREADS = 4
 
         # System-wide key for marking an important moment mid-meeting
         self.MARKER_HOTKEY = "ctrl+shift+m"
@@ -329,6 +341,10 @@ class MeetingRecorderGUI:
                 self.WHISPER_COMPUTE = str(s.get("whisper_compute", self.WHISPER_COMPUTE))
                 self.REALTIME_WHISPER_MODEL = str(s.get(
                     "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
+                self.REALTIME_BACKEND = str(s.get(
+                    "realtime_backend", self.REALTIME_BACKEND))
+                self.FAST_ASR_THREADS = int(s.get(
+                    "fast_asr_threads", self.FAST_ASR_THREADS))
                 self.MARKER_HOTKEY = str(s.get("marker_hotkey", self.MARKER_HOTKEY))
                 self.CAPTURE_MAX_EDGE = int(s.get("capture_max_edge", self.CAPTURE_MAX_EDGE))
                 region = s.get("capture_region")
@@ -360,6 +376,8 @@ class MeetingRecorderGUI:
                 "whisper_device": self.WHISPER_DEVICE,
                 "whisper_compute": self.WHISPER_COMPUTE,
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
+                "realtime_backend": self.REALTIME_BACKEND,
+                "fast_asr_threads": self.FAST_ASR_THREADS,
                 "marker_hotkey": self.MARKER_HOTKEY,
                 "capture_region": self.CAPTURE_REGION,
                 "capture_max_edge": self.CAPTURE_MAX_EDGE,
@@ -767,14 +785,23 @@ class MeetingRecorderGUI:
     def _preload_model(self):
         def _load():
             try:
-                from faster_whisper import WhisperModel
-                self.root.after(0, self._log,
-                    f"文字起こしモデルを事前読み込み中... ({self.REALTIME_WHISPER_MODEL})")
-                self._preloaded_transcriber = WhisperModel(
-                    self.REALTIME_WHISPER_MODEL,
-                    device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
-                self.root.after(0, self._log,
-                    f"文字起こしモデル読み込み完了 ({self.REALTIME_WHISPER_MODEL})")
+                if self.REALTIME_BACKEND == "fast_ja_en":
+                    from fast_asr import FastJapaneseEnglishASR
+                    self.root.after(0, self._log,
+                        "高速日本語/英語モデルを事前読み込み中...")
+                    model_dir = os.path.join(BASE_DIR, "models", "fast_ja_en")
+                    self._preloaded_transcriber = FastJapaneseEnglishASR(
+                        model_dir, threads=self.FAST_ASR_THREADS)
+                    self.root.after(0, self._log, "高速日本語/英語モデル読み込み完了")
+                else:
+                    from faster_whisper import WhisperModel
+                    self.root.after(0, self._log,
+                        f"文字起こしモデルを事前読み込み中... ({self.REALTIME_WHISPER_MODEL})")
+                    self._preloaded_transcriber = WhisperModel(
+                        self.REALTIME_WHISPER_MODEL,
+                        device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
+                    self.root.after(0, self._log,
+                        f"文字起こしモデル読み込み完了 ({self.REALTIME_WHISPER_MODEL})")
             except Exception as e:
                 self.root.after(0, self._log, f"[事前読み込みエラー] {e}")
         threading.Thread(target=_load, daemon=True).start()
@@ -1193,6 +1220,7 @@ class MeetingRecorderGUI:
                     "roles": bool(meta.get("ROLE_TRACKS")),
                     "report": os.path.exists(os.path.join(path, "meeting_report.md")),
                     "html": os.path.exists(os.path.join(path, "meeting_report.html")),
+                    "final_html": os.path.exists(os.path.join(path, "transcription_final.html")),
                 })
         rows.sort(key=lambda r: (r["start"] or "", r["path"]), reverse=True)
         return rows
@@ -1246,7 +1274,7 @@ class MeetingRecorderGUI:
                 return True
             if not full_text:
                 return False
-            for fname in ("meeting_report.md", "transcription.txt"):
+            for fname in ("meeting_report.md", "transcription_final.txt", "transcription.txt"):
                 path = os.path.join(row["path"], fname)
                 if not os.path.exists(path):
                     continue
@@ -1266,7 +1294,12 @@ class MeetingRecorderGUI:
             for row in rows:
                 if not _matches(row, query, var_full.get()):
                     continue
-                report = ("md + html" if row["html"] else "md") if row["report"] else "未生成"
+                if row["report"]:
+                    report = "議事録 md + html" if row["html"] else "議事録 md"
+                elif row["final_html"]:
+                    report = "補正済みHTML"
+                else:
+                    report = "未生成"
                 item = tree.insert("", "end", values=(
                     row["start"] or "-", row["name"], row["images"],
                     row["markers"] or "", "✓" if row["roles"] else "",
@@ -1300,6 +1333,18 @@ class MeetingRecorderGUI:
                 messagebox.showinfo("未生成",
                     f"meeting_report.{kind} がありません。先に後処理を実行してください。")
 
+        def _open_final_html():
+            row = _selected()
+            if not row:
+                return
+            path = os.path.join(row["path"], "transcription_final.html")
+            if os.path.exists(path):
+                os.startfile(path)
+            else:
+                messagebox.showinfo("未生成",
+                    "transcription_final.html がありません。\n"
+                    "高速日本語/英語ASRで録音した記録に生成されます。")
+
         def _run_post():
             row = _selected()
             if not row:
@@ -1311,6 +1356,7 @@ class MeetingRecorderGUI:
         bar = ttk.Frame(win, padding=(10, 8))
         bar.pack(side="bottom", fill="x")
         for text, cmd in (("📄 議事録を生成/再生成", _run_post),
+                          ("⚡ 補正済みHTML", _open_final_html),
                           ("📝 Markdown", lambda: _open_report("md")),
                           ("🌐 HTML", lambda: _open_report("html")),
                           ("📁 フォルダを開く", _open_folder),
@@ -1393,6 +1439,18 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
             row=6, column=0, columnspan=3, sticky="w")
 
+        ttk.Label(frame, text="リアルタイムASR:").grid(
+            row=7, column=0, sticky="w", pady=(10, 4))
+        current_rt = next((i for i, (_, v) in enumerate(REALTIME_BACKENDS)
+                           if v == self.REALTIME_BACKEND), 0)
+        combo_rt = ttk.Combobox(frame, width=32, state="readonly",
+            values=[label for label, _ in REALTIME_BACKENDS])
+        combo_rt.grid(row=7, column=1, columnspan=2, padx=(10, 0), pady=(10, 4))
+        combo_rt.current(current_rt)
+        ttk.Label(frame, text="※ 高速版の初回導入: python setup_fast_asr.py",
+            font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
+            row=8, column=0, columnspan=3, sticky="w")
+
         # AI summary
         sum_frame = ttk.LabelFrame(dlg, text=" AI要約（後処理） ", padding=15)
         sum_frame.pack(padx=15, pady=(0, 10), fill="x")
@@ -1421,17 +1479,21 @@ class MeetingRecorderGUI:
         btn_frame.pack(padx=15, pady=(0, 15))
 
         def _ok():
+            old_backend = self.REALTIME_BACKEND
             self.DHASH_THRESHOLD = var_dhash.get()
             self.AUDIO_GAIN = var_gain.get()
             self.JPEG_QUALITY = var_jpeg.get()
             self.CAPTURE_MAX_EDGE = var_edge.get()
             self.OCR_ENABLED = var_ocr.get()
+            self.REALTIME_BACKEND = REALTIME_BACKENDS[combo_rt.current()][1]
+            if old_backend != self.REALTIME_BACKEND:
+                self._preloaded_transcriber = None
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
             self.SUMMARY_MODEL = entry_model.get().strip()
             self._save_settings()
             self._log(f"設定更新: dHash={self.DHASH_THRESHOLD}, ゲイン={self.AUDIO_GAIN:.1f}, "
                       f"JPEG={self.JPEG_QUALITY}, OCR={'有効' if self.OCR_ENABLED else '無効'}, "
-                      f"要約={self.SUMMARY_PROVIDER}")
+                      f"ASR={self.REALTIME_BACKEND}, 要約={self.SUMMARY_PROVIDER}")
             dlg.destroy()
 
         def _cancel():
@@ -1567,8 +1629,28 @@ class MeetingRecorderGUI:
 
     def _log_transcript(self, text):
         self.transcript_area.config(state="normal")
+        ranges = self.transcript_area.tag_ranges("partial")
+        for start, end in zip(ranges[0::2], ranges[1::2]):
+            self.transcript_area.delete(start, end)
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         self.transcript_area.insert(tk.END, f"[{ts}] {text}\n")
+        self.transcript_area.see(tk.END)
+        self.transcript_area.config(state="disabled")
+
+    def _show_partial_transcript(self, text):
+        self.transcript_area.config(state="normal")
+        ranges = self.transcript_area.tag_ranges("partial")
+        for start, end in zip(ranges[0::2], ranges[1::2]):
+            self.transcript_area.delete(start, end)
+        self.transcript_area.insert(tk.END, f"~ {text}\n", "partial")
+        self.transcript_area.tag_config("partial", foreground="#6b7280")
+        self.transcript_area.see(tk.END)
+        self.transcript_area.config(state="disabled")
+
+    def _log_refined_transcript(self, text):
+        self.transcript_area.config(state="normal")
+        self.transcript_area.insert(tk.END, f"  ↳ 補正: {text}\n", "refine")
+        self.transcript_area.tag_config("refine", foreground="#2563eb")
         self.transcript_area.see(tk.END)
         self.transcript_area.config(state="disabled")
 
@@ -1774,6 +1856,7 @@ class MeetingRecorderGUI:
             'now': now, 'dir_name': dir_name,
             'audio_src_str': self._audio_source_label_n(selected),
             'snap_count': snap_count, 'lang': lang,
+            'realtime_backend': self.REALTIME_BACKEND,
             'meeting_name': self._meeting_name,
             'role_tracks': sorted(self._role_writers),
         }
@@ -1820,6 +1903,11 @@ class MeetingRecorderGUI:
                 f.write(f"AUDIO_OTHER_FILE={ROLE_TRACK_OTHER}\n")
             if ctx['mode_full']:
                 f.write("TRANSCRIPTION_FILE=transcription.txt\n")
+                f.write(f"REALTIME_BACKEND={ctx['realtime_backend']}\n")
+                if ctx['realtime_backend'] == "fast_ja_en":
+                    f.write("REFINED_TRANSCRIPTION_FILE=transcription_refined.txt\n")
+                    f.write("FINAL_TRANSCRIPTION_FILE=transcription_final.txt\n")
+                    f.write("FINAL_TRANSCRIPTION_HTML=transcription_final.html\n")
 
         elapsed = time.time() - ctx['start_epoch']
         m, s = divmod(int(elapsed), 60)
@@ -1838,9 +1926,12 @@ class MeetingRecorderGUI:
                 "動作ログの「[スキップ]」「無音（データ未着）」を確認してください。\n\n"
                 f"フォルダー:\n{dir_name}")
         else:
+            final_html = os.path.join(dir_name, "transcription_final.html")
+            html_note = ("\n\n補正済みHTML: transcription_final.html"
+                         if os.path.exists(final_html) else "")
             self.root.after(0, messagebox.showinfo, "完了",
                 f"すべての記録が正常に保存されました。\n\n"
-                f"音声: 約{audio_sec:.0f}秒\n\nフォルダー:\n{dir_name}")
+                f"音声: 約{audio_sec:.0f}秒{html_note}\n\nフォルダー:\n{dir_name}")
         self.root.after(0, self._reset_ui)
 
     # --------------------------------------------------- FFmpeg (Captura pattern)
@@ -2298,7 +2389,7 @@ class MeetingRecorderGUI:
             except Exception as e:
                 print(f"[クローズ警告] {dev['name']}: {e}")
 
-    # ------------------------------------------ Transcription (faster-whisper)
+    # ------------------------------------------ Transcription (fast ja/en or whisper)
 
     def _transcription_start(self, dir_name):
         try:
@@ -2307,25 +2398,97 @@ class MeetingRecorderGUI:
                 self._preloaded_transcriber = None
                 self.root.after(0, self._log, "事前読み込み済みモデルを使用")
             else:
-                from faster_whisper import WhisperModel
-                self.root.after(0, self._log,
-                    f"文字起こしモデルを読み込み中... ({self.REALTIME_WHISPER_MODEL})")
-                self.transcriber = WhisperModel(
-                    self.REALTIME_WHISPER_MODEL,
-                    device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
+                if self.REALTIME_BACKEND == "fast_ja_en":
+                    from fast_asr import FastJapaneseEnglishASR
+                    self.root.after(0, self._log, "高速日本語/英語モデルを読み込み中...")
+                    self.transcriber = FastJapaneseEnglishASR(
+                        os.path.join(BASE_DIR, "models", "fast_ja_en"),
+                        threads=self.FAST_ASR_THREADS)
+                else:
+                    from faster_whisper import WhisperModel
+                    self.root.after(0, self._log,
+                        f"文字起こしモデルを読み込み中... ({self.REALTIME_WHISPER_MODEL})")
+                    self.transcriber = WhisperModel(
+                        self.REALTIME_WHISPER_MODEL,
+                        device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
 
             lang = LANG_OPTIONS[self.combo_lang.current()][1]
             self._rt_lang = None if lang == "auto" else lang
+            self._rt_detected_lang = None
+            self._fast_final_segments = []
+            self._fast_refined_segments = []
 
             self.transcription_file = open(
                 os.path.join(dir_name, "transcription.txt"), "w", encoding="utf-8")
+            if self.REALTIME_BACKEND == "fast_ja_en":
+                self.refined_transcription_file = open(
+                    os.path.join(dir_name, "transcription_refined.txt"),
+                    "w", encoding="utf-8")
             self._transcribe_start = time.time()
             self.root.after(0, self._log, "文字起こしスレッド起動")
-            threading.Thread(target=self._transcribe_loop, daemon=True).start()
+            loop = (self._transcribe_fast_loop if self.REALTIME_BACKEND == "fast_ja_en"
+                    else self._transcribe_loop)
+            self._transcribe_thread = threading.Thread(target=loop, daemon=True)
+            self._transcribe_thread.start()
 
         except Exception as e:
             self.root.after(0, self._log, f"[文字起こしエラー] {e}")
             self.transcriber = None
+
+    def _record_fast_results(self, events):
+        for result in events:
+            text = result.text.strip()
+            if not text:
+                continue
+            if result.kind == "partial":
+                self.root.after(0, self._show_partial_transcript, text)
+                continue
+            if result.kind == "refine":
+                self._fast_refined_segments.append(result)
+                self.root.after(0, self._log_refined_transcript, text)
+                if self.refined_transcription_file:
+                    elapsed = time.time() - self._transcribe_start
+                    self.refined_transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
+                    self.refined_transcription_file.flush()
+                continue
+            self._fast_final_segments.append(result)
+            self.root.after(0, self._log_transcript, text)
+            if self.transcription_file:
+                elapsed = time.time() - self._transcribe_start
+                self.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
+                self.transcription_file.flush()
+            if (self._rt_lang is None and result.language
+                    and result.language != self._rt_detected_lang):
+                self._rt_detected_lang = result.language
+                label = "日本語" if result.language == "ja" else "English"
+                self._write_language_event(result.language, label)
+
+    def _transcribe_fast_loop(self):
+        """Feed mixed PCM continuously to the ja/en Zipformer VAD pipeline."""
+        from scipy.signal import resample_poly
+
+        while self.is_recording and not self.stop_event.is_set():
+            if self.transcribe_queue is None or self.transcriber is None:
+                time.sleep(0.05)
+                continue
+            try:
+                pcm = self.transcribe_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
+                mono_16k = resample_poly(
+                    mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
+                self._record_fast_results(self.transcriber.accept(mono_16k, self._rt_lang))
+            except Exception as e:
+                self.root.after(0, self._log, f"[高速文字起こし処理エラー] {e}")
+
+        if self.transcriber is not None:
+            try:
+                self._record_fast_results(self.transcriber.flush(self._rt_lang))
+            except Exception as e:
+                self.root.after(0, self._log, f"[高速文字起こし終了警告] {e}")
 
     def _transcribe_loop(self):
         """Chunk-driven real-time transcription loop.
@@ -2416,13 +2579,81 @@ class MeetingRecorderGUI:
             self.root.after(0, self._log, f"[文字起こし処理エラー] {e}")
             return prev_lang
 
+    def _write_fast_final_outputs(self):
+        """Merge fast finals with range-based refinements and export TXT/HTML."""
+        if not self._recording_dir:
+            return
+        refinements = sorted(self._fast_refined_segments,
+                             key=lambda e: (e.start_sample, e.end_sample))
+        rows = []
+        for event in self._fast_final_segments:
+            covered = any(
+                event.start_sample < refined.end_sample
+                and event.end_sample > refined.start_sample
+                for refined in refinements)
+            if not covered:
+                rows.append(event)
+        rows.extend(refinements)
+        rows.sort(key=lambda e: e.start_sample)
+        if not rows:
+            return
+
+        txt_path = os.path.join(self._recording_dir, "transcription_final.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for event in rows:
+                seconds = event.start_sample / self.TRANSCRIBE_RATE
+                f.write(f"[{fmt_timestamp(seconds)}] [{event.language}] {event.text.strip()}\n")
+
+        audio_name = "audio_main.mp3"
+        items = []
+        for event in rows:
+            seconds = event.start_sample / self.TRANSCRIBE_RATE
+            items.append(
+                '<div class="line" data-time="{time:.3f}" tabindex="0">'
+                '<span class="time">{stamp}</span>'
+                '<span class="lang">{lang}</span>'
+                '<span class="text">{text}</span></div>'.format(
+                    time=seconds, stamp=fmt_timestamp(seconds),
+                    lang=html.escape(event.language), text=html.escape(event.text.strip())))
+        title = html.escape(self._meeting_name or "文字起こし（補正済み）")
+        html_path = os.path.join(self._recording_dir, "transcription_final.html")
+        document = f"""<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>{title}</title><style>
+body{{font-family:"BIZ UDPGothic","Yu Gothic",sans-serif;max-width:960px;margin:32px auto;padding:0 18px;color:#1f2937}}
+h1{{font-size:1.5rem}} audio{{position:sticky;top:0;width:100%;background:white;padding:8px 0}}
+.line{{display:grid;grid-template-columns:76px 44px 1fr;gap:8px;padding:9px 6px;border-bottom:1px solid #e5e7eb;cursor:pointer}}
+.line:hover{{background:#eff6ff}} .time{{color:#2563eb;font-family:monospace}} .lang{{color:#6b7280}}
+</style></head><body><h1>{title}</h1>
+<p>補正済みリアルタイム文字起こし。行をクリックすると音声が移動します。</p>
+<audio id="audio" controls preload="metadata" src="{html.escape(audio_name)}"></audio>
+<main>{''.join(items)}</main><script>
+const audio=document.getElementById('audio');
+document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{audio.currentTime=Number(x.dataset.time);audio.play();}}));
+</script></body></html>"""
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(document)
+        self.root.after(0, self._log,
+            "補正済み最終稿 -> transcription_final.txt / transcription_final.html")
+
     def _transcription_stop(self):
-        # WhisperModel needs no explicit close/stop — just drop the reference.
+        # Let the worker flush its VAD/tail before dropping the recognizer.
+        if self._transcribe_thread is not None:
+            self._transcribe_thread.join(timeout=5)
+            self._transcribe_thread = None
+        if self.REALTIME_BACKEND == "fast_ja_en":
+            try:
+                self._write_fast_final_outputs()
+            except Exception as e:
+                self.root.after(0, self._log, f"[補正済み最終稿の出力エラー] {e}")
         self.transcriber = None
         if self.transcription_file:
             self.transcription_file.close()
             self.transcription_file = None
             self.root.after(0, self._log, "文字起こし完了 -> transcription.txt")
+        if self.refined_transcription_file:
+            self.refined_transcription_file.close()
+            self.refined_transcription_file = None
         self.transcribe_queue = None
 
 

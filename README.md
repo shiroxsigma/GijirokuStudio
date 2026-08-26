@@ -11,7 +11,7 @@
 - **スライド自動キャプチャ** — 5秒ごとに画面変化（dHash）を検知し、切り替わった瞬間だけ JPEG で保存。手動キャプチャも可能
 - **キャプチャ範囲の指定** — ドラッグで資料領域だけを切り出し。誤検知が減り、OCR 精度とファイルサイズも改善
 - **⭐ マーカー** — 会議中に「今の重要」をワンボタン／グローバルホットキーで記録。議事録でハイライトされ、AI要約でも優先される
-- **リアルタイム文字起こし（高負荷モード）** — ローカル AI（faster-whisper）で話しながら文字起こし
+- **リアルタイム文字起こし（高負荷モード）** — 高速なReazonSpeech（日英）または faster-whisper を選択可能
 - **議事録の自動生成（後処理）** — 高精度文字起こし → スライドOCR → AI要約 → Markdown / HTML / DOCX 出力
 - **AI要約** — サマリ・決定事項・アクションアイテム（担当／期限）・未決事項を抽出。Ollama（ローカル完結）または Claude API を選択
 - **スライドOCR** — Windows 内蔵の日本語 OCR でスライドの文字を抽出。音声で拾えない数値・固有名詞を補完（既定 OFF）
@@ -38,6 +38,17 @@ pipenv install                      # Pipfile から一括インストール
 ```
 
 主な依存パッケージ: `mss`, `pillow`, `imagehash`, `pyaudiowpatch`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`, `moonshine-voice`
+
+高速な日本語／英語リアルタイム文字起こしを初回セットアップする場合:
+
+```powershell
+.venv\Scripts\python.exe setup_fast_asr.py
+```
+
+CPU向けの `sherpa-onnx`、日本語ReazonSpeech、英語Parakeet、日英言語判定、
+日本語句読点復元、Silero VADを `models/fast_ja_en/` に導入します。発話中の
+暫定字幕と無音後の二段パス補正も有効になります。従来のfaster-whisperへは
+「設定 → 設定を開く」から戻せます。
 
 任意の追加パッケージ（使う機能に応じて）:
 
@@ -182,6 +193,8 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 | `whisper_device` | `cpu` | `cpu` / `cuda`（NVIDIA GPU） |
 | `whisper_compute` | `int8` | CPU=`int8`、CUDA=`float16` など |
 | `realtime_whisper_model` | `base` | 高負荷モードのリアルタイム文字起こし用モデル |
+| `realtime_backend` | `fast_ja_en` | `fast_ja_en`（高速な日英）/ `whisper`（従来方式） |
+| `fast_asr_threads` | `4` | 高速な日英文字起こしに使うCPUスレッド数 |
 | `marker_hotkey` | `ctrl+shift+m` | マーカーのグローバルホットキー |
 | `summary_provider` | `none` | `none` / `ollama` / `claude` |
 | `summary_model` | （空） | 空なら各プロバイダの既定 |
@@ -233,10 +246,17 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 ├── language_segments.jsonl # 言語切替のタイミングログ
 ├── ocr.jsonl               # スライドOCRの結果キャッシュ
 ├── transcription.txt       # リアルタイム文字起こし（高負荷モード時のみ）
+├── transcription_refined.txt # 二段パス補正稿（高速日英ASR時のみ）
+├── transcription_final.txt # 速報を補正結果で置換した最終稿（高速日英ASR時のみ）
+├── transcription_final.html # 音声時刻へ移動できる補正済みHTML
 ├── meeting_report.md       # 議事録（Markdown）
 ├── meeting_report.html     # 議事録（単一HTML・共有用）
 └── meeting_report.docx     # 議事録（Word）※export_docx=true 時
 ```
+
+`transcription_final.*` は録音直後に高速ASRで作る確認用成果物です。「議事録を生成
+（後処理）」はこれを流用せず、音声から `large-v3-turbo`（設定値）で再認識するため、
+時間をかけて精度を優先した `meeting_report.*` が生成されます。
 
 ### 単一HTMLについて
 
