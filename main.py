@@ -23,6 +23,10 @@ import imagehash
 import sounddevice as sd
 import pyaudiowpatch as pyaudio
 
+from realtime_audio import (EchoReferenceProcessor, PartialLeakageGuard,
+                            remove_cross_role_duplicates,
+                            remove_cross_role_line_duplicates)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
@@ -280,6 +284,8 @@ class MeetingRecorderGUI:
         self._audio_queues = []         # per-device capture queues (during recording)
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
+        self._echo_processor = None
+        self._leakage_guard = PartialLeakageGuard()
         self._asr_load_ema = 0.0
         self._asr_load_level = 0
         # PortAudio init/open/terminate are not thread-safe: with several devices
@@ -306,6 +312,7 @@ class MeetingRecorderGUI:
         self.REALTIME_WHISPER_MODEL = "base"
         self.REALTIME_BACKEND = "fast_ja_en"
         self.FAST_ASR_THREADS = 4
+        self.ECHO_DELAY_MS = 0
 
         # System-wide key for marking an important moment mid-meeting
         self.MARKER_HOTKEY = "ctrl+shift+m"
@@ -348,6 +355,8 @@ class MeetingRecorderGUI:
                     "realtime_backend", self.REALTIME_BACKEND))
                 self.FAST_ASR_THREADS = int(s.get(
                     "fast_asr_threads", self.FAST_ASR_THREADS))
+                self.ECHO_DELAY_MS = int(s.get(
+                    "echo_delay_ms", self.ECHO_DELAY_MS))
                 self.MARKER_HOTKEY = str(s.get("marker_hotkey", self.MARKER_HOTKEY))
                 self.CAPTURE_MAX_EDGE = int(s.get("capture_max_edge", self.CAPTURE_MAX_EDGE))
                 region = s.get("capture_region")
@@ -381,6 +390,7 @@ class MeetingRecorderGUI:
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
                 "realtime_backend": self.REALTIME_BACKEND,
                 "fast_asr_threads": self.FAST_ASR_THREADS,
+                "echo_delay_ms": self.ECHO_DELAY_MS,
                 "marker_hotkey": self.MARKER_HOTKEY,
                 "capture_region": self.CAPTURE_REGION,
                 "capture_max_edge": self.CAPTURE_MAX_EDGE,
@@ -1817,6 +1827,7 @@ class MeetingRecorderGUI:
         self._audio_queues = [queue.Queue(maxsize=200) for _ in range(n)]
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
+        self._echo_processor = None
 
         # Speaker separation needs both sides captured; with one side there is
         # nothing to separate and the role tracks would just duplicate the mix.
@@ -1828,6 +1839,14 @@ class MeetingRecorderGUI:
                 ROLE_SELF: queue.Queue(maxsize=400),
                 ROLE_OTHER: queue.Queue(maxsize=400),
             }
+            try:
+                self._echo_processor = EchoReferenceProcessor(
+                    self.TARGET_RATE, self.ECHO_DELAY_MS)
+                self.root.after(0, self._log,
+                    "WebRTC AEC3: スピーカー音をマイクから除去")
+            except Exception as e:
+                self.root.after(0, self._log,
+                    f"[AEC無効] pywebrtc-audioを利用できません: {e}")
         elif mode_full:
             self.transcribe_queue = queue.Queue(maxsize=400)
 
@@ -2078,6 +2097,27 @@ class MeetingRecorderGUI:
     def _push_transcribe(self, pcm, role_chunks=None):
         """Forward a PCM chunk to the transcription queue (no-op in light mode)."""
         if self.transcribe_role_queues:
+            if self._echo_processor is not None and role_chunks:
+                try:
+                    mic = role_chunks.get(ROLE_SELF, bytes(len(pcm)))
+                    speaker = role_chunks.get(ROLE_OTHER, bytes(len(pcm)))
+                    processed = self._echo_processor.process(mic, speaker)
+                    if processed is None:
+                        return
+                    chunks = {
+                        ROLE_SELF: processed["self"],
+                        ROLE_OTHER: processed["other"],
+                    }
+                    for role, q in self.transcribe_role_queues.items():
+                        try:
+                            q.put_nowait(chunks[role])
+                        except queue.Full:
+                            self._queue_overflow_count += 1
+                    return
+                except Exception as e:
+                    self._echo_processor = None
+                    self.root.after(0, self._log,
+                        f"[AEC停止・通常認識へ復帰] {e}")
             silence = None
             for role, q in self.transcribe_role_queues.items():
                 chunk = role_chunks.get(role) if role_chunks else None
@@ -2486,6 +2526,7 @@ class MeetingRecorderGUI:
             self._rt_detected_lang = None
             self._fast_final_segments = []
             self._fast_refined_segments = []
+            self._leakage_guard = PartialLeakageGuard()
             self._asr_load_ema = 0.0
             self._asr_load_level = 0
             if self.REALTIME_BACKEND == "fast_ja_en" and self.transcribe_role_queues:
@@ -2519,6 +2560,11 @@ class MeetingRecorderGUI:
             result.speaker = speaker
             text = result.text.strip()
             if not text:
+                continue
+            if speaker == ROLE_OTHER:
+                self._leakage_guard.remember_other(text)
+            elif (speaker == ROLE_SELF
+                  and self._leakage_guard.is_leakage(text)):
                 continue
             if result.kind == "partial":
                 self.root.after(0, self._show_partial_transcript,
@@ -2583,7 +2629,11 @@ class MeetingRecorderGUI:
 
         while self.is_recording and not self.stop_event.is_set():
             got = False
-            for speaker, q in queues.items():
+            # Decode the clean far-end reference first. Its text can then guard
+            # the mic result from being displayed as a leaked "self" partial.
+            order = sorted(queues, key=lambda role: role != ROLE_OTHER)
+            for speaker in order:
+                q = queues[speaker]
                 if q is None:
                     continue
                 try:
@@ -2593,13 +2643,19 @@ class MeetingRecorderGUI:
                 got = True
                 try:
                     t0 = time.perf_counter()
-                    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                    mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
-                    mono_16k = resample_poly(
-                        mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
+                    if isinstance(pcm, np.ndarray):
+                        mono_16k = pcm.astype(np.float32, copy=False)
+                        mono = mono_16k
+                        source_rate = self.TRANSCRIBE_RATE
+                    else:
+                        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                        mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
+                        mono_16k = resample_poly(
+                            mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
+                        source_rate = self.TARGET_RATE
                     self._record_fast_results(
                         sessions[speaker].accept(mono_16k, self._rt_lang), speaker)
-                    audio_s = max(len(mono) / self.TARGET_RATE, 0.001)
+                    audio_s = max(len(mono) / source_rate, 0.001)
                     self._update_asr_load(
                         (time.perf_counter() - t0) / audio_s, sessions)
                 except Exception as e:
@@ -2719,6 +2775,7 @@ class MeetingRecorderGUI:
                 rows.append(event)
         rows.extend(refinements)
         rows.sort(key=lambda e: e.start_sample)
+        rows = remove_cross_role_duplicates(rows, ROLE_SELF, ROLE_OTHER)
         if not rows:
             return
 
@@ -2784,6 +2841,9 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
             self.refined_transcription_file = None
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
+        if self._echo_processor is not None:
+            self._echo_processor.reset()
+            self._echo_processor = None
 
 
 # ======================================================================
@@ -3241,6 +3301,7 @@ def transcribe_meeting(data, report, span=(0.10, 0.80)):
     # way every run.
     rank = {ROLE_OTHER: 0, ROLE_SELF: 1}
     lines.sort(key=lambda l: (l["start"], rank.get(l.get("speaker"), 9)))
+    lines = remove_cross_role_line_duplicates(lines, ROLE_SELF, ROLE_OTHER)
     data["lines"] = lines
     data["detected_langs"] = sorted(detected)
     report(hi, f"文字起こし完了: {len(lines)}行")

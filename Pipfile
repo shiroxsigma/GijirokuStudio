@@ -13,6 +13,7 @@ moonshine-voice = "*"
 numpy = "*"
 scipy = "*"
 faster-whisper = "*"
+pywebrtc-audio = "==0.1.0"
 
 [optional]
 # 高速リアルタイム日本語/英語ASR（setup_fast_asr.py でも導入可能）

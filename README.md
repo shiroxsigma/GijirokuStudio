@@ -146,7 +146,9 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 
 後処理ではこの2本を別々に文字起こしし、時系列でマージして話者タグを付けます。
 
-> ⚠️ **ヘッドセットの使用を推奨します。** スピーカーから音を出していると、相手の声をマイクが拾って `audio_self.mp3` に混入し、同じ発言が「自分」「相手」の両方に現れることがあります。
+スピーカーから相手の声がマイクへ回り込む場合は、WebRTC AEC3がループバック音声を参照してリアルタイム認識用のマイク音声からエコーを除去します。さらに、時間が重なった類似認識を比較し、相手側を優先して最終TXT・HTMLの重複を除去します。録音される役割別MP3は検証可能な原音のままです。
+
+> ⚠️ AECでも大音量、入力クリップ、別の再生機器から入った音は完全に除去できません。最も確実なのはヘッドセットの使用です。
 
 ---
 
@@ -197,6 +199,7 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 | `realtime_whisper_model` | `base` | 高負荷モードのリアルタイム文字起こし用モデル |
 | `realtime_backend` | `fast_ja_en` | `fast_ja_en`（高速な日英）/ `whisper`（従来方式） |
 | `fast_asr_threads` | `4` | 高速な日英文字起こしに使うCPUスレッド数 |
+| `echo_delay_ms` | `0` | AECへ渡す再生→マイクの遅延ヒント（`0`は自動推定） |
 | `marker_hotkey` | `ctrl+shift+m` | マーカーのグローバルホットキー |
 | `summary_provider` | `none` | `none` / `ollama` / `claude` |
 | `summary_model` | （空） | 空なら各プロバイダの既定 |
