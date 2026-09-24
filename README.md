@@ -35,10 +35,10 @@
 ```bash
 # 1) 仮想環境を作成して依存パッケージをインストール
 python -m pipenv --python 3.13     # open_py313.bat と同等
-pipenv install                      # Pipfile から一括インストール
+pipenv sync                         # Pipfile.lock の固定バージョンをインストール
 ```
 
-主な依存パッケージ: `mss`, `pillow`, `imagehash`, `pyaudiowpatch`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`, `moonshine-voice`
+主な依存パッケージ: `mss`, `pillow`, `imagehash`, `pyaudiowpatch`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`
 
 高速な日本語／英語リアルタイム文字起こしを初回セットアップする場合:
 
