@@ -312,6 +312,7 @@ class MeetingRecorderGUI:
         # faster-whisper (real-time) settings — smaller model for low latency
         self.REALTIME_WHISPER_MODEL = "base"
         self.REALTIME_BACKEND = "fast_ja_en"
+        self.POSTPROCESS_BACKEND = "whisper"
         self.FAST_ASR_THREADS = 4
         self.ECHO_DELAY_MS = 0
 
@@ -354,6 +355,8 @@ class MeetingRecorderGUI:
                     "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
                 self.REALTIME_BACKEND = str(s.get(
                     "realtime_backend", self.REALTIME_BACKEND))
+                self.POSTPROCESS_BACKEND = str(s.get(
+                    "postprocess_backend", self.POSTPROCESS_BACKEND))
                 self.FAST_ASR_THREADS = int(s.get(
                     "fast_asr_threads", self.FAST_ASR_THREADS))
                 self.ECHO_DELAY_MS = int(s.get(
@@ -390,6 +393,7 @@ class MeetingRecorderGUI:
                 "whisper_compute": self.WHISPER_COMPUTE,
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
                 "realtime_backend": self.REALTIME_BACKEND,
+                "postprocess_backend": self.POSTPROCESS_BACKEND,
                 "fast_asr_threads": self.FAST_ASR_THREADS,
                 "echo_delay_ms": self.ECHO_DELAY_MS,
                 "marker_hotkey": self.MARKER_HOTKEY,
@@ -1499,6 +1503,15 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
             row=8, column=0, columnspan=3, sticky="w")
 
+        ttk.Label(frame, text="後処理ASR:").grid(
+            row=9, column=0, sticky="w", pady=(10, 4))
+        current_post = next((i for i, (_, v) in enumerate(REALTIME_BACKENDS)
+                             if v == self.POSTPROCESS_BACKEND), 1)
+        combo_post = ttk.Combobox(frame, width=32, state="readonly",
+            values=[label for label, _ in REALTIME_BACKENDS])
+        combo_post.grid(row=9, column=1, columnspan=2, padx=(10, 0), pady=(10, 4))
+        combo_post.current(current_post)
+
         # AI summary
         sum_frame = ttk.LabelFrame(dlg, text=" AI要約（後処理） ", padding=15)
         sum_frame.pack(padx=15, pady=(0, 10), fill="x")
@@ -1534,6 +1547,7 @@ class MeetingRecorderGUI:
             self.CAPTURE_MAX_EDGE = var_edge.get()
             self.OCR_ENABLED = var_ocr.get()
             self.REALTIME_BACKEND = REALTIME_BACKENDS[combo_rt.current()][1]
+            self.POSTPROCESS_BACKEND = REALTIME_BACKENDS[combo_post.current()][1]
             if old_backend != self.REALTIME_BACKEND:
                 self._preloaded_transcriber = None
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
@@ -1541,7 +1555,8 @@ class MeetingRecorderGUI:
             self._save_settings()
             self._log(f"設定更新: dHash={self.DHASH_THRESHOLD}, ゲイン={self.AUDIO_GAIN:.1f}, "
                       f"JPEG={self.JPEG_QUALITY}, OCR={'有効' if self.OCR_ENABLED else '無効'}, "
-                      f"ASR={self.REALTIME_BACKEND}, 要約={self.SUMMARY_PROVIDER}")
+                      f"リアルタイムASR={self.REALTIME_BACKEND}, "
+                      f"後処理ASR={self.POSTPROCESS_BACKEND}, 要約={self.SUMMARY_PROVIDER}")
             dlg.destroy()
 
         def _cancel():
@@ -3091,7 +3106,7 @@ class _WhisperEngine:
         return detect_ja_en(self.model, clip) if self.model is not None else "ja"
 
     def transcribe(self, clip, lang, sr):
-        """Yield (start_seconds_within_clip, text) for one audio window."""
+        """Yield (start_seconds_within_clip, text, language) for one audio window."""
         if self.model is not None:
             segments, _info = self.model.transcribe(
                 clip, language=lang, initial_prompt=self.prompt,
@@ -3099,7 +3114,7 @@ class _WhisperEngine:
             for seg in segments:
                 text = seg.text.strip()
                 if text:
-                    yield (seg.start or 0.0), text
+                    yield (seg.start or 0.0), text, lang
             return
         from moonshine_voice import Transcriber, get_model_for_language
         model_path, arch = get_model_for_language(
@@ -3111,7 +3126,49 @@ class _WhisperEngine:
             transcriber.close()
         for line in transcript.lines:
             if line.text.strip():
-                yield (line.start_time or 0.0), line.text.strip()
+                yield (line.start_time or 0.0), line.text.strip(), lang
+
+
+class _FastPostEngine:
+    """Run the fast Japanese/English recognizers on recorded audio."""
+
+    def __init__(self, terms, report):
+        from fast_asr import FastJapaneseEnglishASR
+        cfg = load_app_settings()
+        replacements = {alias: term["form"] for term in terms
+                        for alias in term.get("aliases", [])
+                        if alias and alias != term["form"]}
+        report(None, "高速ASRモデルを読み込み中...")
+        self.model = FastJapaneseEnglishASR(
+            os.path.join(BASE_DIR, "models", "fast_ja_en"),
+            threads=cfg.get("fast_asr_threads", 4), replacements=replacements)
+        self.name = "高速ASR (ReazonSpeech / Parakeet)"
+        self.report = report
+
+    def transcribe(self, clip, lang, sr):
+        if lang not in ("ja", "en", None):
+            raise ValueError("高速ASRは日本語・英語のみに対応しています。後処理ASRをWhisperに変更してください。")
+        session = self.model.clone_session()
+        session.partials_enabled = False
+        results = []
+
+        def collect(events):
+            for event in events:
+                if event.kind == "final":
+                    results.append(event)
+                elif event.kind == "refine":
+                    results[:] = [old for old in results
+                                  if not (event.start_sample <= old.start_sample
+                                          < event.end_sample)]
+                    results.append(event)
+
+        step = sr
+        for start in range(0, len(clip), step):
+            collect(session.accept(clip[start:start + step], lang_hint=lang))
+            self.report.check()
+        collect(session.flush(lang_hint=lang))
+        for event in sorted(results, key=lambda e: e.start_sample):
+            yield event.start_sample / sr, event.text, event.language
 
 
 def _lang_at(lang_segments, elapsed, default_lang):
@@ -3125,13 +3182,13 @@ def _lang_at(lang_segments, elapsed, default_lang):
     return lang
 
 
-def transcribe_meeting(data, report, span=(0.10, 0.80)):
+def transcribe_meeting(data, report, span=(0.10, 0.80), backend="whisper"):
     """Transcribe every audio track of a meeting into data["lines"].
 
     When per-role tracks exist the mixed audio is skipped: transcribing it as
     well would cover the same speech a third time for no benefit. Each track is
-    cut into VAD speech windows first, so silence — most of a role track, since
-    only one side speaks at a time — costs nothing.
+    split into VAD speech windows. The fast recognizer also performs its own
+    VAD within each window to preserve accurate utterance times.
     """
     terms = load_glossary()
     prompt = build_whisper_prompt(terms)
@@ -3143,7 +3200,15 @@ def transcribe_meeting(data, report, span=(0.10, 0.80)):
     else:
         tracks = [(data["audio_file"], None)]
 
-    engine = _WhisperEngine(prompt, report)
+    if backend == "fast_ja_en":
+        if not data["auto_mode"] and data["language"] not in ("ja", "en"):
+            raise ValueError(
+                "高速ASRは日本語・英語のみに対応しています。後処理ASRをWhisperに変更してください。")
+        engine = _FastPostEngine(terms, report)
+    elif backend == "whisper":
+        engine = _WhisperEngine(prompt, report)
+    else:
+        raise ValueError(f"不明な後処理ASR: {backend}")
     data["engine"] = engine.name
 
     lines = []
@@ -3170,12 +3235,17 @@ def transcribe_meeting(data, report, span=(0.10, 0.80)):
         for start_sample, end_sample in windows:
             clip = audio[start_sample:end_sample]
             start_s = start_sample / sr
-            lang = (engine.detect_language(clip) if auto_mode
+            lang = ("auto" if auto_mode and backend == "fast_ja_en" else
+                    engine.detect_language(clip) if auto_mode
                     else _lang_at(data["lang_segments"], start_s, default_lang))
-            detected.add(lang)
+            if backend == "fast_ja_en" and lang not in ("ja", "en", "auto"):
+                raise ValueError(
+                    "高速ASRは日本語・英語のみに対応しています。後処理ASRをWhisperに変更してください。")
             report(base + per_track * (done / spoken),
                    f"{tag}文字起こし {done:.0f}/{spoken:.0f}秒 [{start_s:.0f}s〜] {lang}")
-            for offset, text in engine.transcribe(clip, lang, sr):
+            hint = None if backend == "fast_ja_en" and lang == "auto" else lang
+            for offset, text, actual_lang in engine.transcribe(clip, hint, sr):
+                detected.add(actual_lang)
                 lines.append({"start": start_s + offset, "text": text,
                               "speaker": speaker})
                 # faster-whisper decodes lazily as segments are consumed, so a
@@ -4240,7 +4310,7 @@ def import_video_file(video_path, language="auto", progress=None, cancel=None,
     return folder
 
 
-def post_process_folder(folder, progress=None, cancel=None):
+def post_process_folder(folder, progress=None, cancel=None, backend=None):
     """Transcribe a meeting folder and generate the report files.
 
     progress: optional callable(fraction | None, message) for UI feedback.
@@ -4254,7 +4324,9 @@ def post_process_folder(folder, progress=None, cancel=None):
     data = collect_meeting_data(folder)
     report(0.02, f"音声: {data['audio_name']} / 画像: {len(data['images'])}枚")
 
-    transcribe_meeting(data, report, span=(0.05, 0.80))
+    selected_backend = backend or load_app_settings().get("postprocess_backend", "whisper")
+    report(None, f"後処理ASR: {selected_backend}")
+    transcribe_meeting(data, report, span=(0.05, 0.80), backend=selected_backend)
 
     report(0.82, "スライドOCR")
     try:
@@ -4302,6 +4374,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GijirokuStudio v2")
     parser.add_argument("--post-process", metavar="FOLDER",
         help="指定フォルダの音声を高精度文字起こしし、スクリーンショットと統合したMarkdownを出力")
+    parser.add_argument("--postprocess-backend", choices=("fast_ja_en", "whisper"),
+        help="後処理の文字起こし方式（未指定なら設定画面の選択を使用）")
     parser.add_argument("--import-video", metavar="VIDEO",
         help="動画から音声を抽出し、文字起こしと議事録を生成")
     parser.add_argument("--video-snapshots", action="store_true",
@@ -4312,14 +4386,14 @@ if __name__ == "__main__":
         try:
             imported_folder = import_video_file(
                 args.import_video, capture_scenes=args.video_snapshots)
-            post_process_folder(imported_folder)
+            post_process_folder(imported_folder, backend=args.postprocess_backend)
             print(f"  - 保存先: {imported_folder}")
         except Exception as e:
             print(f"[ERROR] {e}")
             sys.exit(1)
     elif args.post_process:
         try:
-            post_process_folder(args.post_process)
+            post_process_folder(args.post_process, backend=args.postprocess_backend)
         except Exception as e:
             print(f"[ERROR] {e}")
             sys.exit(1)

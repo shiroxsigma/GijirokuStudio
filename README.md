@@ -13,7 +13,7 @@
 - **⭐ マーカー** — 会議中に「今の重要」をワンボタン／グローバルホットキーで記録。議事録でハイライトされ、AI要約でも優先される
 - **リアルタイム文字起こし（高負荷モード）** — 高速なReazonSpeech（日英）または faster-whisper を選択可能
 - **リアルタイム話者分離** — マイクとスピーカーを別々に認識し、暫定字幕から最終HTMLまで「自分 / 相手」を維持
-- **議事録の自動生成（後処理）** — 高精度文字起こし → スライドOCR → AI要約 → Markdown / HTML / DOCX 出力
+- **議事録の自動生成（後処理）** — 高速ASR（日英）または Whisper を選択して再文字起こし → スライドOCR → AI要約 → Markdown / HTML / DOCX 出力
 - **AI要約** — サマリ・決定事項・アクションアイテム（担当／期限）・未決事項を抽出。Ollama（ローカル完結）または Claude API を選択
 - **スライドOCR** — Windows 内蔵の日本語 OCR でスライドの文字を抽出。音声で拾えない数値・固有名詞を補完（既定 OFF）
 - **記録一覧ブラウザ** — 過去の記録を一覧・全文検索し、その場で再後処理
@@ -40,7 +40,7 @@ pipenv sync                         # Pipfile.lock の固定バージョンを�
 
 主な依存パッケージ: `mss`, `pillow`, `imagehash`, `pyaudiowpatch`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`
 
-高速な日本語／英語リアルタイム文字起こしを初回セットアップする場合:
+高速な日本語／英語文字起こしを初回セットアップする場合（リアルタイム・後処理共通）:
 
 ```powershell
 .venv\Scripts\python.exe setup_fast_asr.py
@@ -73,6 +73,8 @@ CPU負荷に応じた字幕頻度の自動調整も有効になります。従�
 
 ```bash
 python main.py --post-process "<会議フォルダのパス>"
+# 一回だけ方式を指定する場合
+python main.py --post-process "<会議フォルダのパス>" --postprocess-backend fast_ja_en
 ```
 
 ---
@@ -91,7 +93,7 @@ python main.py --post-process "<会議フォルダのパス>"
    - **⭐ マーカー**（既定 `Ctrl+Shift+M`）で重要な瞬間を記録。**他アプリが前面でも効きます**
    - **📷 手動キャプチャ**で任意タイミングのスクリーンショット
 5. **■ 記録を停止して保存**
-6. **📄 議事録を生成（後処理）** — 進捗バーが表示され、**✖ 中断**でいつでも止められます
+6. **📄 議事録を生成（後処理）** — 「設定 → 設定を開く」の「後処理ASR」で高速ASR（日英）または Whisper を選択できます。進捗バーが表示され、**✖ 中断**でいつでも止められます
 
 過去の記録は **メニュー → 記録 → 記録一覧を開く** から一覧・検索・再後処理できます。
 
@@ -204,6 +206,7 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 | `whisper_compute` | `int8` | CPU=`int8`、CUDA=`float16` など |
 | `realtime_whisper_model` | `base` | 高負荷モードのリアルタイム文字起こし用モデル |
 | `realtime_backend` | `fast_ja_en` | `fast_ja_en`（高速な日英）/ `whisper`（従来方式） |
+| `postprocess_backend` | `whisper` | 後処理の文字起こし方式。`fast_ja_en` は日本語・英語のみ |
 | `fast_asr_threads` | `4` | 高速な日英文字起こしに使うCPUスレッド数 |
 | `echo_delay_ms` | `0` | AECへ渡す再生→マイクの遅延ヒント（`0`は自動推定） |
 | `marker_hotkey` | `ctrl+shift+m` | マーカーのグローバルホットキー |
@@ -266,8 +269,9 @@ pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapsho
 ```
 
 `transcription_final.*` は録音直後に高速ASRで作る確認用成果物です。「議事録を生成
-（後処理）」はこれを流用せず、音声から `large-v3-turbo`（設定値）で再認識するため、
-時間をかけて精度を優先した `meeting_report.*` が生成されます。
+（後処理）」は録音音声を選択した方式で再認識し、`meeting_report.*` を生成します。
+Whisper を選ぶと `large-v3-turbo`（設定値）で精度を優先し、高速ASRを選ぶと
+ReazonSpeech／Parakeet で日本語・英語を処理します。
 
 ### 単一HTMLについて
 
