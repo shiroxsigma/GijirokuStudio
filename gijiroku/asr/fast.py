@@ -51,7 +51,7 @@ class FastJapaneseEnglishASR:
         self.reazon = self._build_reazon()
         self.parakeet = self._build_parakeet()
         self.lid = self._build_lid()
-        from fast_punct import JapanesePunctuator
+        from .punct import JapanesePunctuator
         self.punctuator = JapanesePunctuator(
             os.path.join(models_dir, "mojicast-punct-onnx"), self.threads)
 

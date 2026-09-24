@@ -5,8 +5,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from fast_asr import FastASREvent
-from main import _FastPostEngine, _Reporter, PostProcessCancelled
+from gijiroku.asr.fast import FastASREvent
+from gijiroku.postprocess.transcribe import _FastPostEngine
+from gijiroku.postprocess.common import _Reporter, PostProcessCancelled
 
 
 class _Session:

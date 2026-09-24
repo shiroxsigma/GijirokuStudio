@@ -7,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 from scipy.signal import butter, sosfilt
 
-from audio_pipeline import (CaptureClock, CapturePacket, TimelineSource,
+from gijiroku.recording import (CaptureClock, CapturePacket, TimelineSource,
                             DuplicateMixer, RecordingProcessor, RATE, FRAMES)
 
 
@@ -200,21 +200,21 @@ class ProcessingTests(unittest.TestCase):
 
 class IntegrationTests(unittest.TestCase):
     def test_identically_named_physical_mics_are_preserved(self):
-        from main import MeetingRecorderGUI
+        from gijiroku.gui import MeetingRecorderGUI
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         devices = [dict(name='USB Microphone', index=i, max_input_channels=1,
                         default_samplerate=48000, hostapi=0 if i < 2 else 1)
                    for i in range(4)]
         pa = SimpleNamespace(get_loopback_device_info_generator=lambda: [],
                              terminate=lambda: None)
-        with patch('main.pyaudio.PyAudio', return_value=pa), \
-             patch('main.sd.query_hostapis', return_value=[{'name': 'MME'}, {'name': 'Windows WASAPI'}]), \
-             patch('main.sd.query_devices', return_value=devices):
+        with patch('gijiroku.gui.pyaudio.PyAudio', return_value=pa), \
+             patch('gijiroku.gui.sd.query_hostapis', return_value=[{'name': 'MME'}, {'name': 'Windows WASAPI'}]), \
+             patch('gijiroku.gui.sd.query_devices', return_value=devices):
             gui._enumerate_audio_devices()
         self.assertEqual([x['native_idx'] for x in gui._audio_devices], [2, 3])
 
     def test_asr_role_queues_drop_together(self):
-        from main import MeetingRecorderGUI, ROLE_SELF, ROLE_OTHER
+        from gijiroku.gui import MeetingRecorderGUI, ROLE_SELF, ROLE_OTHER
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         own, other = queue.Queue(maxsize=1), queue.Queue(maxsize=1)
         own.put(b'previous')
@@ -225,7 +225,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(gui._queue_overflow_count, 1)
 
     def test_fast_asr_drains_after_recording_stops(self):
-        from main import MeetingRecorderGUI
+        from gijiroku.gui import MeetingRecorderGUI
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         accepted = []
         gui.transcriber = SimpleNamespace(
@@ -247,7 +247,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(accepted, [1600])
 
     def test_stop_flushes_parallel_sources_on_one_timeline(self):
-        from main import MeetingRecorderGUI, _EOF, ROLE_SELF, ROLE_OTHER
+        from gijiroku.gui import MeetingRecorderGUI, _EOF, ROLE_SELF, ROLE_OTHER
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         gui._audio_origin = 10
         gui._audio_stop_time = 10.05

@@ -28,6 +28,12 @@
 - 同梱の `ffmpeg.exe`（プロジェクト直下に配置済み）
 - マイク・スピーカーが利用可能なオーディオ環境
 
+ソースコードは `gijiroku/` にまとめています。`main.py` はGUI・CLIの起動口、
+`setup_fast_asr.py` はモデル導入用です。録音処理は `gijiroku/recording.py`、
+文字起こしは `gijiroku/asr/`、議事録生成は `gijiroku/postprocess/`、
+テストは `tests/`、過去の仕様書は `docs/` にあります。
+`ffmpeg.exe`、`models/`、`settings.json`、会議フォルダは従来どおりプロジェクト直下に置きます。
+
 ---
 
 ## 📦 セットアップ

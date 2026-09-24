@@ -1,0 +1,1 @@
+"""GijirokuStudio application package."""

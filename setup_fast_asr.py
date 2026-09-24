@@ -1,4 +1,4 @@
-"""Install the optional CPU-only Japanese/English realtime ASR assets."""
+"""Install the optional CPU-only Japanese/English ASR assets."""
 import os
 import subprocess
 import sys
@@ -6,10 +6,9 @@ import tarfile
 import tempfile
 import urllib.request
 
-from fast_asr import LID_DIR, PARAKEET_DIR, REAZON_DIR
+from gijiroku.asr.fast import LID_DIR, PARAKEET_DIR, REAZON_DIR
+from gijiroku.paths import MODELS_DIR
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models", "fast_ja_en")
 TAG = "asr-models"
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
