@@ -23,7 +23,9 @@ import imagehash
 import sounddevice as sd
 import pyaudiowpatch as pyaudio
 
-from realtime_audio import (EchoReferenceProcessor, PartialLeakageGuard,
+from audio_pipeline import (CaptureClock, TimelineSource, RecordingProcessor,
+                            RATE as AUDIO_RATE, FRAMES as AUDIO_FRAMES)
+from realtime_audio import (PartialLeakageGuard,
                             remove_cross_role_duplicates,
                             remove_cross_role_line_duplicates)
 
@@ -284,7 +286,7 @@ class MeetingRecorderGUI:
         self._audio_queues = []         # per-device capture queues (during recording)
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
-        self._echo_processor = None
+        self._audio_finished = threading.Event()
         self._leakage_guard = PartialLeakageGuard()
         self._asr_load_ema = 0.0
         self._asr_load_level = 0
@@ -297,11 +299,10 @@ class MeetingRecorderGUI:
         self.DHASH_THRESHOLD = 10
         self.JPEG_QUALITY = 85
         self.AUDIO_GAIN = 2.0
-        self.TARGET_RATE = 44100
+        self.TARGET_RATE = AUDIO_RATE
         self.TRANSCRIBE_RATE = 16000
         self.TRANSCRIBE_CHUNK_SECONDS = 5.0   # real-time chunk length fed to faster-whisper
         self.TRANSCRIBE_OVERLAP_SECONDS = 1.0  # trailing overlap kept across chunks
-        self.STARVE_SECONDS = 0.5   # a source silent this long stops blocking the mix
 
         # faster-whisper (post-processing) settings — editable via settings.json
         self.WHISPER_MODEL = "large-v3-turbo"
@@ -646,7 +647,7 @@ class MeetingRecorderGUI:
                 hostapis = list(sd.query_hostapis())
             except Exception:
                 hostapis = []
-            best = {}      # dedupe key -> (priority, entry)
+            best = {}      # dedupe key -> (priority, entries from that API)
             order = []     # dedupe keys in first-seen order
             skipped = 0
             for info in sd.query_devices():
@@ -676,13 +677,21 @@ class MeetingRecorderGUI:
                 }
                 k = self._dedupe_key(name)
                 if k not in best:
-                    best[k] = (prio, entry)
+                    best[k] = (prio, [entry])
                     order.append(k)
                 else:
-                    skipped += 1
-                    if prio < best[k][0]:
-                        best[k] = (prio, entry)
-            devices.extend(best[k][1] for k in order)
+                    old_prio, entries = best[k]
+                    if prio == old_prio:
+                        # Two identical USB microphones can have identical
+                        # names. Distinct indices within one API are real
+                        # endpoints, not aliases of the same capture stream.
+                        entries.append(entry)
+                    elif prio < old_prio:
+                        skipped += len(entries)
+                        best[k] = (prio, [entry])
+                    else:
+                        skipped += 1
+            devices.extend(entry for k in order for entry in best[k][1])
             if skipped:
                 print(f"[デバイス列挙] 別ホストAPIの重複マイク {skipped}件を非表示")
         except Exception as e:
@@ -1749,6 +1758,7 @@ class MeetingRecorderGUI:
             self.stop_event.clear()
             self._pcm_written = 0
             self._queue_overflow_count = 0
+            self._audio_stop_time = None
             self._record_start = time.time()
             self._recording_mon_idx = self.combo_monitor.current()
             with mss.MSS() as sct:
@@ -1772,6 +1782,7 @@ class MeetingRecorderGUI:
             self._pipeline_thread.start()
         else:
             # UI resets instantly; cleanup runs in background
+            self._audio_stop_time = time.monotonic()
             self.is_recording = False
             self.stop_event.set()
             self._stop_hotkey()
@@ -1818,6 +1829,9 @@ class MeetingRecorderGUI:
         self._write_language_event(lang, label)
 
         start_epoch = time.time()
+        self._audio_origin = time.monotonic()
+        self._audio_error = None
+        self._audio_packets = 0
         selected = self._selected_audio_devices()
         n = len(selected)
         mode_full = self.combo_mode.current() == 1
@@ -1827,7 +1841,7 @@ class MeetingRecorderGUI:
         self._audio_queues = [queue.Queue(maxsize=200) for _ in range(n)]
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
-        self._echo_processor = None
+        self._audio_finished.clear()
 
         # Speaker separation needs both sides captured; with one side there is
         # nothing to separate and the role tracks would just duplicate the mix.
@@ -1839,16 +1853,21 @@ class MeetingRecorderGUI:
                 ROLE_SELF: queue.Queue(maxsize=400),
                 ROLE_OTHER: queue.Queue(maxsize=400),
             }
-            try:
-                self._echo_processor = EchoReferenceProcessor(
-                    self.TARGET_RATE, self.ECHO_DELAY_MS)
-                self.root.after(0, self._log,
-                    "WebRTC AEC3: スピーカー音をマイクから除去")
-            except Exception as e:
-                self.root.after(0, self._log,
-                    f"[AEC無効] pywebrtc-audioを利用できません: {e}")
         elif mode_full:
             self.transcribe_queue = queue.Queue(maxsize=400)
+
+        try:
+            self._recording_processor = RecordingProcessor(
+                [d["kind"] for d in selected], self.AUDIO_GAIN, self.ECHO_DELAY_MS)
+        except Exception as e:
+            self.root.after(0, self._log, f"[録音開始失敗] 音声処理を初期化できません: {e}")
+            self.root.after(0, messagebox.showerror, "録音開始失敗",
+                            f"エコー除去を初期化できません。依存パッケージを確認してください。\n{e}")
+            self.root.after(0, self._reset_ui)
+            return
+        self.root.after(0, self._log,
+            "重複音声抑制: 有効 / " + ("マイク別AEC: 有効（録音・文字起こし共通）"
+                                       if separate else "時刻同期: 有効"))
 
         if not self._start_writers(dir_name, out_mp3, separate):
             self.root.after(0, self._log, "[エラー] ffmpeg 起動失敗")
@@ -1867,18 +1886,11 @@ class MeetingRecorderGUI:
         for t in threads:
             t.start()
 
-        if n == 1:
-            writer_t = threading.Thread(
-                target=self._single_writer,
-                args=(active, self._audio_queues[0]), daemon=True)
-            writer_t.start()
-            mixer_t = None
-        else:
-            mixer_t = threading.Thread(
-                target=self._mixer_loop_n,
-                args=(active, self._audio_queues, selected), daemon=True)
-            mixer_t.start()
-            writer_t = None
+        mixer_t = threading.Thread(
+            target=self._mixer_loop_n,
+            args=(active, self._audio_queues, selected), daemon=True)
+        mixer_t.start()
+        writer_t = None
 
         # Screen capture
         next_target = time.time() + self.INTERVAL
@@ -1968,6 +1980,9 @@ class MeetingRecorderGUI:
             f.write(f"SNAPSHOT_COUNT={ctx['snap_count']}\n")
             f.write(f"MARKER_COUNT={self._marker_count}\n")
             f.write("AUDIO_FILE=audio_main.mp3\n")
+            f.write("AUDIO_PROCESSING=timestamped_per_mic_aec_dedup\n")
+            if self._audio_error:
+                f.write(f"AUDIO_PROCESSING_ERROR={self._audio_error}\n")
             f.write(f"LANGUAGE={ctx['lang']}\n")
             if ctx['role_tracks']:
                 f.write(f"ROLE_TRACKS={','.join(ctx['role_tracks'])}\n")
@@ -1992,11 +2007,14 @@ class MeetingRecorderGUI:
         self._pipeline_ctx = None
         self._last_record_dir = dir_name
         self.root.after(0, self._log, msg)
-        if self._pcm_written == 0:
+        if self._audio_error:
+            self.root.after(0, messagebox.showwarning, "音声処理エラーで停止",
+                f"処理済みの音声を保存しました。\n{self._audio_error}\n\n{dir_name}")
+        elif self._pcm_written == 0 or self._audio_packets == 0:
             self.root.after(0, messagebox.showwarning, "音声なし",
-                "音声が1バイトも記録されませんでした。\n\n"
+                "音声デバイスから録音データを取得できませんでした。\n\n"
                 "選択したデバイスがすべて無音／使用不可の可能性があります。\n"
-                "動作ログの「[スキップ]」「無音（データ未着）」を確認してください。\n\n"
+                "動作ログの「[スキップ]」「[キャプチャエラー]」を確認してください。\n\n"
                 f"フォルダー:\n{dir_name}")
         else:
             final_html = os.path.join(dir_name, "transcription_final.html")
@@ -2064,60 +2082,16 @@ class MeetingRecorderGUI:
             self.ffmpeg_proc = None
             self.root.after(0, self._log, "ffmpeg エンコード完了 -> MP3 保存済み")
 
-    # ---------------------------------------------------- Audio normalization
-
-    def _to_stereo_s16le(self, raw_bytes, channels, rate):
-        channels = max(1, int(channels))
-        # Keep whole frames only: a short/odd tail would make reshape() raise
-        # inside the audio callback.
-        usable = len(raw_bytes) - (len(raw_bytes) % (2 * channels))
-        if usable <= 0:
-            return b""
-        data = np.frombuffer(raw_bytes, dtype=np.int16,
-                             count=usable // 2).astype(np.float32)
-        if channels == 1:
-            data = np.column_stack([data, data]).flatten()
-        elif channels > 2:
-            data = data.reshape(-1, channels)[:, :2].flatten()
-        if rate != self.TARGET_RATE and len(data) >= 4:
-            stereo = data.reshape(-1, 2)
-            n_in = len(stereo)
-            n_out = max(1, int(n_in * self.TARGET_RATE / rate))
-            x_in = np.arange(n_in, dtype=np.float64)
-            x_out = np.linspace(0, n_in - 1, n_out)
-            left = np.interp(x_out, x_in, stereo[:, 0])
-            right = np.interp(x_out, x_in, stereo[:, 1])
-            data = np.column_stack([left, right]).flatten()
-        data *= self.AUDIO_GAIN
-        np.clip(data, -32768, 32767, out=data)
-        return data.astype(np.int16).tobytes()
-
     # ------------------------------------------------- Transcribe forwarding
 
     def _push_transcribe(self, pcm, role_chunks=None):
         """Forward a PCM chunk to the transcription queue (no-op in light mode)."""
         if self.transcribe_role_queues:
-            if self._echo_processor is not None and role_chunks:
-                try:
-                    mic = role_chunks.get(ROLE_SELF, bytes(len(pcm)))
-                    speaker = role_chunks.get(ROLE_OTHER, bytes(len(pcm)))
-                    processed = self._echo_processor.process(mic, speaker)
-                    if processed is None:
-                        return
-                    chunks = {
-                        ROLE_SELF: processed["self"],
-                        ROLE_OTHER: processed["other"],
-                    }
-                    for role, q in self.transcribe_role_queues.items():
-                        try:
-                            q.put_nowait(chunks[role])
-                        except queue.Full:
-                            self._queue_overflow_count += 1
-                    return
-                except Exception as e:
-                    self._echo_processor = None
-                    self.root.after(0, self._log,
-                        f"[AEC停止・通常認識へ復帰] {e}")
+            # The mixer is the only producer. Reserve both roles together;
+            # dropping only one side would shift the ASR sample timelines.
+            if any(q.full() for q in self.transcribe_role_queues.values()):
+                self._queue_overflow_count += 1
+                return
             silence = None
             for role, q in self.transcribe_role_queues.items():
                 chunk = role_chunks.get(role) if role_chunks else None
@@ -2136,184 +2110,95 @@ class MeetingRecorderGUI:
             except queue.Full:
                 self._queue_overflow_count += 1
 
-    # ------------------------------------------- Single-source writer thread
-
-    def _single_writer(self, active, src_queue):
-        """Direct writer for the single-device case (no mixing)."""
-        while (active.is_set() or not src_queue.empty()) and not self.stop_event.is_set():
-            try:
-                pcm = src_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if pcm is _EOF:
-                break
-            self._update_level(pcm)
-            self._write_audio(pcm)
-            self._push_transcribe(pcm)
-
-    # ------------------------------------------------- Mixer thread (N inputs)
+    def _audio_processing_failed(self, detail):
+        self._log(f"[音声処理エラー] {detail}")
+        if self.is_recording:
+            self._toggle_recording()
+        messagebox.showerror("録音を停止しました",
+            "音声処理に失敗したため録音を停止しました。\n"
+            "処理済みの音声は保存します。\n" + detail)
 
     def _mixer_loop_n(self, active, queues, devices=None):
-        """Mix N capture queues into one PCM stream.
-
-        Each input queue may receive the _EOF sentinel to mark end-of-stream for
-        that source. Sources that reach EOF contribute silence; mixing continues
-        with the remaining live sources until every source is exhausted.
-
-        A source may also stop delivering without ever reaching EOF: Windows does
-        not run the audio engine for a loopback endpoint nothing is playing to,
-        so an idle speaker produces no callbacks at all. Such a source is treated
-        as silent after STARVE_SECONDS instead of blocking the whole mix.
-        """
-        N = len(queues)
-        MIX_FRAMES = 1024
-        FRAME_BYTES = 4                      # stereo int16 = 4 bytes
-        MIX_BYTES = MIX_FRAMES * FRAME_BYTES  # 4096 bytes per output chunk
-        OVERFLOW = MIX_BYTES * 50            # ~1.2 sec buffer limit
-        BUF_CAP = MIX_BYTES * 400            # ~9 sec hard cap, memory backstop
-
-        bufs = [bytearray() for _ in range(N)]
-        eof = [False] * N
-        t_start = time.time()
-        last_data = [t_start] * N
-        starved = [False] * N
+        """Render one shared clock; never append device tails sequentially."""
+        sources = [TimelineSource() for _ in queues]
+        ended = [False] * len(queues)
+        origin = self._audio_origin
+        emitted = 0
         stop_deadline = None
-        emitted = 0                 # bytes pushed downstream, for silence padding
-        SILENCE = bytes(MIX_BYTES)
+        pending = bytearray()
+        pending_roles = {ROLE_SELF: bytearray(), ROLE_OTHER: bytearray()}
+        last_duplicates = None
+        last_report = 0
 
-        # Which speaker each source belongs to: mics are me, loopbacks are them.
-        # Left as None when no role tracks are open, so the sub-mix work below
-        # is skipped entirely rather than computed and thrown away.
-        role_of = [None] * N
-        if devices and self._role_writers:
-            role_of = [ROLE_SELF if d.get("kind") == "mic" else ROLE_OTHER
-                       for d in devices[:N]] + [None] * max(0, N - len(devices))
+        def forward():
+            if pending:
+                self._push_transcribe(bytes(pending),
+                    {role: bytes(data) for role, data in pending_roles.items()})
+                pending.clear()
+                for data in pending_roles.values():
+                    data.clear()
 
-        def _name(i):
-            if devices and i < len(devices):
-                return devices[i]["name"]
-            return f"source{i}"
-
-        def _emit(raw, role_chunks=None):
-            nonlocal emitted
-            emitted += len(raw)
-            self._update_level(raw)
-            self._write_audio(raw, role_chunks)
-            self._push_transcribe(raw, role_chunks)
-
-        def _solo(i):
-            """A single source's chunk, tagged with its role for the role track."""
-            raw = bytes(bufs[i][:MIX_BYTES])
-            del bufs[i][:MIX_BYTES]
-            return raw, ({role_of[i]: raw} if role_of[i] else None)
-
-        def _drain(i):
-            for _ in range(30):
-                item = self._qget(queues[i], timeout=0)
-                if item is None:
-                    return
-                if item is _EOF:
-                    eof[i] = True
-                    return
-                bufs[i].extend(item)
-                last_data[i] = time.time()
-
-        while not self.stop_event.is_set():
-            live = [i for i in range(N) if not eof[i]]
-
-            got = False
-            for i in live:
-                before = len(bufs[i])
-                _drain(i)
-                if len(bufs[i]) != before or eof[i]:
-                    got = True
-
-            now = time.time()
-            for i in live:
-                quiet = now - last_data[i] >= self.STARVE_SECONDS
-                if quiet != starved[i]:
-                    starved[i] = quiet
-                    state = "無音（データ未着）" if quiet else "受信再開"
-                    self.root.after(0, self._log, f"[音声] {_name(i)}: {state}")
-
-            # Mix aligned chunks. Sources that are live but have gone quiet do not
-            # hold the mix back — they simply contribute nothing to these chunks.
+        try:
             while True:
-                ready = [i for i in live if len(bufs[i]) >= MIX_BYTES]
-                blocking = [i for i in live
-                            if len(bufs[i]) < MIX_BYTES and not starved[i]]
-                if not ready or blocking:
+                for i, q in enumerate(queues):
+                    for _ in range(200):
+                        item = self._qget(q, timeout=0)
+                        if item is None:
+                            break
+                        if item is _EOF:
+                            ended[i] = True
+                            break
+                        sources[i].add(item)
+                        self._audio_packets += 1
+                now = time.monotonic()
+                stopping = self.stop_event.is_set() or not active.is_set()
+                if stopping:
+                    if stop_deadline is None:
+                        stop_deadline = now + 0.75
+                    # Capture callbacks have already stopped on is_recording.
+                    # Give their final packets time to arrive before the flush.
+                    if not all(ended) and now < stop_deadline:
+                        time.sleep(0.01)
+                        continue
+                    stop_at = self._audio_stop_time or now
+                    limit = max(0, round((stop_at - origin) * self.TARGET_RATE))
+                else:
+                    # Fixed jitter budget; idle endpoints never block others.
+                    limit = max(0, int((now - origin - 0.20) * self.TARGET_RATE))
+                    limit -= limit % AUDIO_FRAMES
+                while emitted < limit:
+                    blocks = [source.read(origin + emitted / self.TARGET_RATE)
+                              for source in sources]
+                    raw, own, other = self._recording_processor.process(blocks)
+                    count = min(AUDIO_FRAMES, limit - emitted)
+                    raw, own, other = (x[:count * 4] for x in (raw, own, other))
+                    roles = {ROLE_SELF: own, ROLE_OTHER: other}
+                    self._update_level(raw)
+                    self._write_audio(raw, roles)
+                    pending.extend(raw)
+                    for role, data in roles.items():
+                        pending_roles[role].extend(data)
+                    if len(pending) >= self.TARGET_RATE * 4 // 10:
+                        forward()
+                    emitted += count
+                duplicates = (self._recording_processor.mic_mixer.duplicates,
+                              self._recording_processor.speaker_mixer.duplicates)
+                if duplicates != last_duplicates and now - last_report >= 5:
+                    if any(duplicates) or last_duplicates is not None:
+                        self.root.after(0, self._log,
+                            f"[重複音声抑制] マイク {duplicates[0]} / スピーカー {duplicates[1]}")
+                    last_duplicates, last_report = duplicates, now
+                if stopping:
+                    forward()
                     break
-                acc = np.zeros(MIX_BYTES // 2, dtype=np.float32)
-                by_role = {}
-                for i in ready:
-                    chunk = np.frombuffer(bytes(bufs[i][:MIX_BYTES]),
-                        dtype=np.int16).astype(np.float32)
-                    acc += chunk
-                    if role_of[i] is not None:
-                        by_role.setdefault(role_of[i], []).append(chunk)
-                    del bufs[i][:MIX_BYTES]
-                acc *= (1.0 / len(ready))    # average-mix: amplitude stays ≤1.0 as sources grow
-                np.clip(acc, -32768, 32767, out=acc)
-                # Each role track averages over its OWN sources only — dividing
-                # by the global count would quietly halve one speaker's volume.
-                role_chunks = {}
-                for role, chunks in by_role.items():
-                    racc = np.sum(chunks, axis=0)
-                    racc *= (1.0 / len(chunks))
-                    np.clip(racc, -32768, 32767, out=racc)
-                    role_chunks[role] = racc.astype(np.int16).tobytes()
-                _emit(acc.astype(np.int16).tobytes(), role_chunks)
-
-            # Overflow fallback: one source bloated while others lag → emit solo
-            for i in live:
-                others_short = all(
-                    len(bufs[k]) < MIX_BYTES
-                    for k in range(N) if k != i and not eof[k])
-                if others_short and len(bufs[i]) > OVERFLOW:
-                    while len(bufs[i]) >= MIX_BYTES:
-                        _emit(*_solo(i))
-
-            # Keep the timeline honest. With only idle loopback devices selected
-            # nothing arrives at all, and the MP3 would end up shorter than the
-            # meeting — transcript timestamps would no longer line up with the
-            # snapshots. Pad the gap with real silence, but only while every live
-            # source is starved, so normal mixing is never second-guessed.
-            if live and all(starved[i] for i in live) and not self.stop_event.is_set():
-                deficit = int((now - t_start) * self.TARGET_RATE * FRAME_BYTES) - emitted
-                while deficit >= MIX_BYTES:
-                    _emit(SILENCE)
-                    deficit -= MIX_BYTES
-
-            # Memory backstop: never let a stalled mix grow without bound
-            for i in range(N):
-                if len(bufs[i]) > BUF_CAP:
-                    drop = len(bufs[i]) - BUF_CAP
-                    drop -= drop % FRAME_BYTES
-                    del bufs[i][:drop]
-                    self._queue_overflow_count += 1
-
-            # Termination: stop requested and every source reached EOF. A capture
-            # thread wedged in the driver must not hold the file open forever.
-            if not active.is_set():
-                if all(eof[i] for i in range(N)):
-                    break
-                if stop_deadline is None:
-                    stop_deadline = now + 3.0
-                elif now > stop_deadline:
-                    self.root.after(0, self._log,
-                        "[音声] 応答しないデバイスを待たずにミキシングを終了")
-                    break
-
-            if not got:
-                time.sleep(0.01)
-
-        # Flush remaining whole-frame data
-        for i in range(N):
-            usable = len(bufs[i]) - (len(bufs[i]) % FRAME_BYTES)
-            if usable:
-                raw = bytes(bufs[i][:usable])
-                _emit(raw, {role_of[i]: raw} if role_of[i] else None)
+                time.sleep(0.005)
+        except Exception as e:
+            self._audio_error = str(e)
+            forward()
+            self.root.after(0, self._audio_processing_failed, str(e))
+        finally:
+            self._queue_overflow_count += sum(source.dropped for source in sources)
+            self._audio_finished.set()
 
     @staticmethod
     def _qget(q, timeout=0.05):
@@ -2357,11 +2242,11 @@ class MeetingRecorderGUI:
         """(channels, rate) combos to try, best first. A device's advertised
         default is not always openable — multi-channel endpoints in particular."""
         combos = []
-        for c in (channels, 2, 1):
+        for c in (min(channels, 2), 1, channels):
             c = int(c)
             if c < 1:
                 continue
-            for r in (rate, 48000, 44100):
+            for r in (48000, rate, 44100):
                 r = int(r)
                 if (c, r) not in combos:
                     combos.append((c, r))
@@ -2369,17 +2254,20 @@ class MeetingRecorderGUI:
 
     def _capture_speaker_dev(self, active, dev, out_queue):
         def _make_callback(ch, sr):
+            clock = CaptureClock(sr, ch)
             def _callback(in_data, frame_count, time_info, status):
                 # An exception raised here propagates into PortAudio's C callback
                 # and can take the process down — never let one escape.
                 try:
-                    pcm = self._to_stereo_s16le(in_data, ch, sr)
-                    if pcm:
-                        out_queue.put_nowait(pcm)
+                    packet = clock.packet(in_data, time_info)
+                    if status:
+                        self._queue_overflow_count += 1
+                    if len(packet.samples):
+                        out_queue.put_nowait(packet)
                 except queue.Full:
-                    pass
+                    self._queue_overflow_count += 1
                 except Exception:
-                    pass
+                    self._queue_overflow_count += 1
                 return (None, pyaudio.paContinue)
             return _callback
 
@@ -2445,15 +2333,18 @@ class MeetingRecorderGUI:
 
     def _capture_mic_dev(self, active, dev, out_queue):
         def _make_callback(ch, sr):
+            clock = CaptureClock(sr, ch)
             def _callback(in_data, frames, time_info, status):
                 try:
-                    pcm = self._to_stereo_s16le(in_data.tobytes(), ch, sr)
-                    if pcm:
-                        out_queue.put_nowait(pcm)
+                    packet = clock.packet(in_data.tobytes(), time_info)
+                    if status:
+                        self._queue_overflow_count += 1
+                    if len(packet.samples):
+                        out_queue.put_nowait(packet)
                 except queue.Full:
-                    pass
+                    self._queue_overflow_count += 1
                 except Exception:
-                    pass
+                    self._queue_overflow_count += 1
             return _callback
 
         stream = None
@@ -2627,7 +2518,8 @@ class MeetingRecorderGUI:
             sessions = {"": self.transcriber}
             queues = {"": self.transcribe_queue}
 
-        while self.is_recording and not self.stop_event.is_set():
+        while (not self._audio_finished.is_set()
+               or any(q is not None and not q.empty() for q in queues.values())):
             got = False
             # Decode the clean far-end reference first. Its text can then guard
             # the mic result from being displayed as a leaked "self" partial.
@@ -2672,7 +2564,7 @@ class MeetingRecorderGUI:
     def _transcribe_loop(self):
         """Chunk-driven real-time transcription loop.
 
-        Incoming PCM (44100Hz stereo int16, from self.transcribe_queue) is
+        Incoming PCM (48kHz stereo int16, from self.transcribe_queue) is
         down-mixed to mono and resampled to 16000Hz. Once ~5 seconds of audio
         has accumulated, faster-whisper transcribes the chunk (auto-detecting
         ja/en when self._rt_lang is None). ~1 second of trailing audio is kept
@@ -2702,12 +2594,14 @@ class MeetingRecorderGUI:
                     except queue.Empty:
                         break
 
-        while self.is_recording and not self.stop_event.is_set():
+        while (not self._audio_finished.is_set()
+               or (self.transcribe_queue is not None and not self.transcribe_queue.empty())):
             if self.transcribe_queue is None or self.transcriber is None:
                 time.sleep(0.1)
                 continue
 
-            _drop_backlog()
+            if self.is_recording:
+                _drop_backlog()
 
             try:
                 pcm = self.transcribe_queue.get(timeout=1.0)
@@ -2824,7 +2718,7 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
     def _transcription_stop(self):
         # Let the worker flush its VAD/tail before dropping the recognizer.
         if self._transcribe_thread is not None:
-            self._transcribe_thread.join(timeout=5)
+            self._transcribe_thread.join()
             self._transcribe_thread = None
         if self.REALTIME_BACKEND == "fast_ja_en":
             try:
@@ -2841,9 +2735,6 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
             self.refined_transcription_file = None
         self.transcribe_queue = None
         self.transcribe_role_queues = {}
-        if self._echo_processor is not None:
-            self._echo_processor.reset()
-            self._echo_processor = None
 
 
 # ======================================================================
