@@ -1,13 +1,18 @@
 import queue
+import os
+import subprocess
+import tempfile
 import threading
 import unittest
+import wave
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 from scipy.signal import butter, sosfilt
 
-from gijiroku.recording import (CaptureClock, CapturePacket, TimelineSource,
+from gijiroku.audio.clock import CaptureClock, CapturePacket
+from gijiroku.audio.pipeline import (TimelineSource,
                             DuplicateMixer, RecordingProcessor, RATE, FRAMES)
 
 
@@ -19,6 +24,52 @@ class CaptureTests(unittest.TestCase):
         second = clock.packet(raw, {'current_time': 10.01, 'input_buffer_adc_time': 10}, 100.04)
         self.assertAlmostEqual(second.start - first.start, .01)
         self.assertEqual(first.samples.shape, (480, 2))
+
+    def test_adc_timestamp_jitter_does_not_insert_audio_gaps(self):
+        clock = CaptureClock(48000, 1)
+        raw = bytes(960)
+        first = clock.packet(raw, {'current_time': 10, 'input_buffer_adc_time': 9.99}, 100)
+        second = clock.packet(raw, {'current_time': 10.03,
+                                    'input_buffer_adc_time': 10.015}, 100.03)
+        self.assertAlmostEqual(second.start - first.start, .01, delta=1 / 48000)
+
+    def test_jittered_adc_packets_render_without_short_silences(self):
+        clock = CaptureClock(RATE, 1)
+        source = TimelineSource()
+        raw = np.full(1024, 6554, dtype=np.int16).tobytes()
+        duration = 1024 / RATE
+        first_start = None
+        for i in range(50):
+            t = 10 + i * duration
+            jitter = (0, .012, -.009)[i % 3]
+            packet = clock.packet(raw, {
+                'current_time': t + .01,
+                'input_buffer_adc_time': t - .01 + jitter,
+            }, 100 + i * duration + .01)
+            if first_start is None:
+                first_start = packet.start
+            source.add(packet)
+        audio = np.concatenate([source.read(first_start + i * FRAMES / RATE)[:, 0]
+                                for i in range(100)])
+        self.assertGreater(np.min(audio[100:-100]), .19)
+
+    def test_native_16k_mic_packets_resample_without_gaps(self):
+        clock = CaptureClock(16000, 1)
+        source = TimelineSource()
+        raw = np.full(1024, 6554, dtype=np.int16).tobytes()
+        start = None
+        for i in range(20):
+            t = 10 + i * 1024 / 16000
+            packet = clock.packet(raw, {
+                'current_time': t + .01,
+                'input_buffer_adc_time': t - .01 + (0, .018, -.012)[i % 3],
+            }, 100 + i * 1024 / 16000 + .01)
+            if start is None:
+                start = packet.start
+            source.add(packet)
+        audio = np.concatenate([source.read(start + i * FRAMES / RATE)[:, 0]
+                                for i in range(100)])
+        self.assertGreater(np.min(audio[100:-100]), .19)
 
     def test_missing_timestamps_preserve_idle_gap(self):
         clock = CaptureClock(48000, 2)
@@ -122,7 +173,7 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(mix, other)
         self.assertEqual(own, bytes(1920))
 
-    def test_idle_speakers_do_not_add_processing_stages(self):
+    def test_silent_speakers_leave_microphone_unprocessed(self):
         instances = []
         class Stub:
             def __init__(self, **kwargs):
@@ -132,13 +183,15 @@ class ProcessingTests(unittest.TestCase):
                 pass
             def process(self, near, far):
                 self.calls += 1
-                return near
+                return near * .1
         processor = RecordingProcessor(['mic'] + ['speaker'] * 8,
                                        processor_factory=Stub)
-        zero = np.zeros((480, 2), np.float32)
+        zero = np.full((480, 2), 3e-5, np.float32)
         mic = np.full((480, 2), .1, np.float32)
-        processor.process([mic] + [zero] * 8)
-        self.assertEqual(sum(x.calls for x in instances), 1)
+        _, own, _ = processor.process([mic] + [zero] * 8)
+        self.assertEqual(sum(x.calls for x in instances), 0)
+        np.testing.assert_allclose(np.frombuffer(own, np.int16),
+                                   np.full(FRAMES * 2, 3276), atol=1)
 
     def test_limiter_preserves_role_sum(self):
         processor = RecordingProcessor(['mic', 'mic'], gain=5)
@@ -199,6 +252,153 @@ class ProcessingTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_capture_tries_device_native_rate_first(self):
+        from gijiroku.gui import MeetingRecorderGUI
+        candidates = MeetingRecorderGUI._format_candidates(1, 16000)
+        self.assertEqual(candidates[0], (1, 16000))
+        self.assertIn((1, 48000), candidates)
+
+    def test_role_mp3_keeps_full_rate_and_does_not_boost_mono(self):
+        from gijiroku.gui import _PcmWriter, FFMPEG_PATH
+        if not os.path.exists(FFMPEG_PATH):
+            self.skipTest('ffmpeg.exe is unavailable')
+        t = np.arange(RATE, dtype=np.float32) / RATE
+        tone = (.25 * np.sin(2 * np.pi * 1000 * t))
+        stereo = np.repeat(tone[:, None], 2, axis=1)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'role.mp3')
+            writer = _PcmWriter(path, RATE, transcription_only=True)
+            writer.write((stereo * 32767).astype(np.int16).tobytes())
+            writer.close()
+            decoded = subprocess.run([FFMPEG_PATH, '-v', 'error', '-i', path,
+                '-f', 'f32le', '-'], capture_output=True, check=True).stdout
+        samples = np.frombuffer(decoded, dtype='<f4')
+        self.assertGreater(len(samples), RATE - 1000)
+        self.assertLess(len(samples), RATE + 1000)
+        self.assertLess(np.max(np.abs(samples)), .30)
+
+    def test_normal_audio_selection_keeps_speakers_and_headset_mic(self):
+        from gijiroku.gui import MeetingRecorderGUI
+        gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
+        class Listbox:
+            def __init__(self):
+                self.selected = set()
+                self.items = []
+            def delete(self, *args):
+                self.items.clear()
+                self.selected.clear()
+            def insert(self, *args):
+                self.items.append(args[-1])
+            def selection_set(self, idx):
+                self.selected.add(idx)
+            def curselection(self):
+                return tuple(sorted(self.selected))
+        gui.listbox_audio = Listbox()
+        loopbacks = [
+            {'index': 10, 'name': 'Headphones (3- FreeClip) [Loopback]', 'maxInputChannels': 2,
+             'defaultSampleRate': 48000},
+            {'index': 11, 'name': 'Speakers [Loopback]', 'maxInputChannels': 2,
+             'defaultSampleRate': 48000},
+        ]
+        inputs = [
+            {'index': 0, 'name': 'Built-in Microphone', 'max_input_channels': 1,
+             'default_samplerate': 48000, 'hostapi': 0},
+            {'index': 1, 'name': 'Built-in Microphone', 'max_input_channels': 1,
+             'default_samplerate': 48000, 'hostapi': 1},
+            {'index': 3, 'name': 'Headset (3- FreeClip)', 'max_input_channels': 1,
+             'default_samplerate': 48000, 'hostapi': 1},
+            {'index': 2, 'name': 'Old Bluetooth Hands-Free', 'max_input_channels': 1,
+             'default_samplerate': 48000, 'hostapi': 2},
+        ]
+        pa = SimpleNamespace(
+            get_default_output_device_info=lambda: {'name': 'Speakers'},
+            get_loopback_device_info_generator=lambda: loopbacks,
+            terminate=lambda: None)
+        with patch('gijiroku.gui.pyaudio.PyAudio', return_value=pa), \
+             patch('gijiroku.gui.sd.query_hostapis', return_value=[
+                 {'name': 'MME'}, {'name': 'Windows WASAPI'},
+                 {'name': 'Windows WDM-KS'}]), \
+             patch('gijiroku.gui.sd.query_devices', return_value=inputs), \
+             patch('gijiroku.gui.sd.default', SimpleNamespace(device=(0, None))):
+            gui._enumerate_audio_devices()
+        gui._populate_audio_listbox()
+        self.assertEqual([d['name'] for d in gui._audio_devices],
+                         ['Headphones (3- FreeClip) [Loopback]', 'Speakers [Loopback]',
+                          'Built-in Microphone', 'Headset (3- FreeClip)'])
+        self.assertEqual(gui.listbox_audio.selected, {0, 1, 3})
+        gui.listbox_audio.selected = set(range(len(gui._audio_devices)))
+        gui.is_recording = False
+        gui._log = lambda *args: None
+        gui._normalize_all_audio_selection()
+        self.assertEqual(gui.listbox_audio.selected, {0, 1, 3})
+
+    def test_recording_revalidates_disconnected_headset(self):
+        from gijiroku.gui import MeetingRecorderGUI
+        gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
+        class Listbox:
+            def __init__(self):
+                self.selected = {0, 1, 2}
+            def curselection(self):
+                return tuple(sorted(self.selected))
+            def selection_clear(self, *args):
+                self.selected.clear()
+            def selection_set(self, idx):
+                self.selected.add(idx)
+        gui.listbox_audio = Listbox()
+        gui._audio_devices = [
+            dict(kind='speaker', name='FreeClip [Loopback]', api='WASAPI', native_idx=7),
+            dict(kind='speaker', name='Speakers [Loopback]', api='WASAPI', native_idx=8),
+            dict(kind='mic', name='FreeClip mic', api='WASAPI', native_idx=9),
+        ]
+        def enumerate_fresh():
+            gui._audio_devices = [
+                dict(kind='speaker', name='Speakers [Loopback]', api='WASAPI', native_idx=4),
+                dict(kind='mic', name='Built-in mic', api='WASAPI', native_idx=5),
+            ]
+        gui._enumerate_audio_devices = enumerate_fresh
+        gui._populate_audio_listbox = lambda: None
+        missing = gui._revalidate_audio_selection()
+        self.assertEqual([d['name'] for d in missing],
+                         ['FreeClip [Loopback]', 'FreeClip mic'])
+        self.assertEqual(gui.listbox_audio.selected, {0})
+        self.assertEqual(gui._selected_audio_devices()[0]['native_idx'], 4)
+
+    def test_two_loopbacks_share_one_portaudio_instance(self):
+        from gijiroku.gui import MeetingRecorderGUI, _EOF
+        gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
+        gui._open_lock = threading.Lock()
+        gui._queue_overflow_count = 0
+        gui.is_recording = False
+        gui.root = SimpleNamespace(after=lambda *args: None)
+        events = []
+        class Stream:
+            def start_stream(self):
+                events.append('start')
+            def stop_stream(self):
+                events.append('stop')
+            def close(self):
+                events.append('close')
+        class PortAudio:
+            def __init__(self):
+                events.append('init')
+            def open(self, **kwargs):
+                events.append(('open', kwargs['input_device_index']))
+                return Stream()
+            def terminate(self):
+                events.append('terminate')
+        tasks = [
+            (dict(name=f'Speaker {i}', native_idx=i, channels=2, rate=48000), queue.Queue())
+            for i in (1, 2)
+        ]
+        with patch('gijiroku.gui.pyaudio.PyAudio', PortAudio), \
+             patch('gijiroku.gui._com_initialize', return_value=False):
+            gui._capture_speakers(threading.Event(), tasks)
+        self.assertEqual(events.count('init'), 1)
+        self.assertEqual(events.count('terminate'), 1)
+        self.assertEqual([e for e in events if isinstance(e, tuple)],
+                         [('open', 1), ('open', 2)])
+        self.assertTrue(all(q.get_nowait() is _EOF for _, q in tasks))
+
     def test_identically_named_physical_mics_are_preserved(self):
         from gijiroku.gui import MeetingRecorderGUI
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
@@ -259,6 +459,7 @@ class IntegrationTests(unittest.TestCase):
         gui.stop_event.set()
         gui._recording_processor = RecordingProcessor(['mic', 'mic'])
         gui._queue_overflow_count = 0
+        gui.AUDIO_DIAGNOSTIC_SECONDS = 1
         gui.root = SimpleNamespace(after=lambda *args: None)
         gui._log = lambda *args: None
         gui._update_level = lambda *args: None
@@ -270,7 +471,16 @@ class IntegrationTests(unittest.TestCase):
             q.put(CapturePacket(10, RATE, np.ones((2400, 2), np.float32) * .1))
             q.put(_EOF)
         active = threading.Event()
-        gui._mixer_loop_n(active, queues)
+        with tempfile.TemporaryDirectory() as folder:
+            gui._recording_dir = folder
+            gui._mixer_loop_n(active, queues,
+                              [{'kind': 'mic'}, {'kind': 'mic'}])
+            with wave.open(os.path.join(folder, 'audio_input_00_mic.wav'), 'rb') as recorded:
+                self.assertEqual(recorded.getframerate(), RATE)
+                self.assertEqual(recorded.getnframes(), 2400)
+            with wave.open(os.path.join(folder, 'audio_capture_00_mic.wav'), 'rb') as captured:
+                self.assertEqual(captured.getframerate(), RATE)
+                self.assertEqual(captured.getnframes(), 2400)
         self.assertIsNone(gui._audio_error)
         self.assertEqual(sum(len(raw) for raw, _ in written), 2400 * 4)
         self.assertEqual(sum(len(raw) for raw, _ in forwarded), 2400 * 4)

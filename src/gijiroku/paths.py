@@ -3,7 +3,8 @@
 import os
 import re
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(SRC_DIR)
 FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 GLOSSARY_PATH = os.path.join(BASE_DIR, "glossary.csv")

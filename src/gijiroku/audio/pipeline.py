@@ -5,64 +5,12 @@ map PortAudio timestamps onto the monotonic clock; no gain or clipping precedes
 AEC. The output contract is exactly 10 ms of 48 kHz stereo per call.
 """
 from collections import deque
-from dataclasses import dataclass
-import math
-import time
-
 import numpy as np
 from scipy.signal import butter, correlate, sosfilt
+from .clock import CapturePacket
 
 RATE = 48000
 FRAMES = RATE // 100
-
-
-@dataclass
-class CapturePacket:
-    start: float
-    rate: int
-    samples: np.ndarray
-
-
-class CaptureClock:
-    """Map a stream's ADC clock to monotonic time without callback jitter."""
-
-    def __init__(self, rate, channels):
-        self.rate = int(rate)
-        self.channels = int(channels)
-        self.offset = None
-        self.next_start = None
-
-    def packet(self, raw, timing, now=None):
-        now = time.monotonic() if now is None else now
-        data = np.frombuffer(raw, dtype=np.int16)
-        data = data[:data.size - data.size % self.channels]
-        data = data.reshape(-1, self.channels).astype(np.float32) / 32768.0
-        if self.channels == 1:
-            data = np.repeat(data, 2, axis=1)
-        elif self.channels > 2:
-            # Capture is requested as stereo first; retain every channel if a
-            # device only supports a multichannel fallback.
-            data = np.repeat(data.mean(axis=1, keepdims=True), 2, axis=1)
-        duration = len(data) / self.rate
-        def value(snake, camel):
-            if isinstance(timing, dict):
-                return float(timing.get(snake, 0))
-            return float(getattr(timing, camel, 0))
-        current = value('current_time', 'currentTime')
-        adc = value('input_buffer_adc_time', 'inputBufferAdcTime')
-        if (math.isfinite(current) and math.isfinite(adc)
-                and current > 0 and adc > 0 and 0 <= current - adc < 2):
-            if self.offset is None:
-                self.offset = now - current
-            start = adc + self.offset
-        else:
-            estimate = now - duration
-            # Some loopback drivers provide zero ADC timestamps. Preserve the
-            # sample clock between callbacks, but leave real idle gaps intact.
-            start = (self.next_start if self.next_start is not None
-                     and abs(estimate - self.next_start) < 0.05 else estimate)
-        self.next_start = start + duration
-        return CapturePacket(start, self.rate, data)
 
 
 class TimelineSource:
@@ -240,12 +188,16 @@ class RecordingProcessor:
         # Deduplication changes only the saved mix, never the echo reference.
         active = []
         for j, reference in enumerate(speaker_blocks):
-            if np.max(np.abs(reference)) > 1e-5:
+            # Silent WASAPI loopbacks may contain low-level dither. A single
+            # nonzero peak is not evidence that audible playback is present.
+            if float(np.mean(reference * reference)) > 1e-8:
                 self.render_tail[j] = 100  # retain one second of acoustic tail
             else:
                 self.render_tail[j] = max(0, self.render_tail[j] - 1)
-            # Retain the final stage for its single noise-suppression pass.
-            running = self.render_tail[j] > 0 or j == len(speaker_blocks) - 1
+            # Do not process a mic against a silent render reference. Running
+            # WebRTC noise suppression in that state gates quiet speech even
+            # though there is no playback echo to remove.
+            running = self.render_tail[j] > 0
             if running and not self.render_running[j]:
                 for processors in self.processors.values():
                     processors[j].reset()

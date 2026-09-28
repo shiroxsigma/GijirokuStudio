@@ -18,7 +18,8 @@ import time
 import pyaudiowpatch as pyaudio
 import sounddevice as sd
 
-from capture_clock import CaptureClock
+from .clock import CaptureClock
+from ..paths import SRC_DIR
 
 
 def identity(name):
@@ -210,7 +211,8 @@ def run(config, output=None, stop=None):
                     config, ensure_ascii=False).encode('utf-8')).decode('ascii')
                 try:
                     probe = subprocess.run(
-                        [sys.executable, os.path.abspath(__file__), encoded, '--probe'],
+                        [sys.executable, '-m', 'gijiroku.audio.capture_worker', encoded, '--probe'],
+                        cwd=SRC_DIR,
                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL, timeout=5,
                         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))

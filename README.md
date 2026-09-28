@@ -30,6 +30,41 @@
 
 ---
 
+## ソースコードの配置
+
+アプリの実装は `src/gijiroku/` にまとめ、機能ごとに管理します。
+
+```text
+src/
+  main.py                   GUI・CLIの起動口
+  setup_fast_asr.py          音声認識モデルの導入
+  gijiroku/
+    gui.py                  録音画面・録音セッションの制御
+    paths.py                ファイルの保存先・共通の名前
+    settings.py             設定・用語辞書の読み込み
+    audio/
+      capture_worker.py     機器ごとの録音・再接続用の子プロセス
+      clock.py              音声の取得時刻・プロセス間で渡すデータ
+      pipeline.py           時刻合わせ・エコー除去・音声の混合
+    asr/                    リアルタイム音声認識・句読点・重複抑制
+    postprocess/            文字起こし・OCR・要約・議事録の出力
+tests/                    自動テスト
+docs/                     仕様書・実機検証手順
+```
+
+起動は `python src/main.py` です。音声の子プロセスは `src/` を作業フォルダとして
+`python -m gijiroku.audio.capture_worker` でアプリから起動します。
+`ffmpeg.exe`、`models/`、`settings.json`、`glossary.csv`、会議フォルダは
+プロジェクト直下に置きます。
+
+テストはプロジェクト直下で実行します。
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+```
+
+---
+
 ## 📦 セットアップ
 
 ```bash
@@ -43,7 +78,7 @@ pipenv sync                         # Pipfile.lock の固定バージョンを�
 高速な日本語／英語文字起こしを初回セットアップする場合（リアルタイム・後処理共通）:
 
 ```powershell
-.venv\Scripts\python.exe setup_fast_asr.py
+.venv\Scripts\python.exe src/setup_fast_asr.py
 ```
 
 CPU向けの `sherpa-onnx`、日本語ReazonSpeech、英語Parakeet、日英言語判定、
@@ -65,16 +100,16 @@ CPU負荷に応じた字幕頻度の自動調整も有効になります。従�
 ## 🚀 起動方法
 
 ```bash
-.venv\Scripts\python.exe main.py
+.venv\Scripts\python.exe src/main.py
 # または RUN_EXE.bat
 ```
 
 後処理だけをコマンドラインで実行する（GUI 不要）：
 
 ```bash
-python main.py --post-process "<会議フォルダのパス>"
+python src/main.py --post-process "<会議フォルダのパス>"
 # 一回だけ方式を指定する場合
-python main.py --post-process "<会議フォルダのパス>" --postprocess-backend fast_ja_en
+python src/main.py --post-process "<会議フォルダのパス>" --postprocess-backend fast_ja_en
 ```
 
 ---
@@ -116,7 +151,7 @@ python main.py --post-process "<会議フォルダのパス>" --postprocess-back
 CLIから実行する場合:
 
 ```powershell
-pipenv run python main.py --import-video "D:\Videos\meeting.mp4" --video-snapshots
+pipenv run python src/main.py --import-video "D:\Videos\meeting.mp4" --video-snapshots
 ```
 
 ---

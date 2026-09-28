@@ -3,7 +3,7 @@
 ## 自動テスト
 
 ```powershell
-.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
 ```
 
 テストは機器を開かず、タイムスタンプ付きPCMと実際のWebRTC AECを使用する。

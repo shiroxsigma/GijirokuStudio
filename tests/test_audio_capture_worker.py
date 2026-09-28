@@ -9,13 +9,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-import audio_capture_worker as worker
-from audio_pipeline import CapturePacket
+from gijiroku.audio import capture_worker as worker
+from gijiroku.audio.clock import CapturePacket
 
 
 class WorkerTests(unittest.TestCase):
     def test_recorder_restarts_after_worker_crash_and_keeps_packets(self):
-        from main import MeetingRecorderGUI, _EOF
+        from gijiroku.gui import MeetingRecorderGUI, _EOF
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         gui._queue_overflow_count = 0
         gui.is_recording = True
@@ -42,8 +42,8 @@ class WorkerTests(unittest.TestCase):
         packets = queue.Queue()
         spec = dict(kind='mic', preferred_name='FreeClip',
                     preferred_api='WASAPI', fallback_name='Built-in mic')
-        with patch('main.subprocess.Popen', side_effect=processes) as popen, \
-             patch('main.time.sleep', return_value=None):
+        with patch('gijiroku.gui.subprocess.Popen', side_effect=processes) as popen, \
+             patch('gijiroku.gui.time.sleep', return_value=None):
             gui._capture_audio_worker(active, spec, packets)
         self.assertEqual(popen.call_count, 2)
         self.assertIsInstance(packets.get_nowait(), CapturePacket)
@@ -51,7 +51,7 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(any('代替機器へ切替' in log for log in logs))
 
     def test_recorder_survives_missing_device_worker_and_stops(self):
-        from main import MeetingRecorderGUI, _EOF
+        from gijiroku.gui import MeetingRecorderGUI, _EOF
         gui = MeetingRecorderGUI.__new__(MeetingRecorderGUI)
         gui.root = SimpleNamespace(after=lambda _delay, fn, *args: fn(*args))
         logs = []
