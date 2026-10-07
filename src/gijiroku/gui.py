@@ -27,10 +27,14 @@ from .paths import (BASE_DIR, SRC_DIR, FFMPEG_PATH, SETTINGS_PATH, MODELS_DIR,
                     ROLE_SELF, ROLE_OTHER, ROLE_TRACK_SELF, ROLE_TRACK_OTHER,
                     sanitize_name)
 from .audio.clock import CaptureClock, CapturePacket
+from .audio.microphone import MicrophoneGate
 from .audio.pipeline import (TimelineSource, RecordingProcessor,
                         RATE as AUDIO_RATE, FRAMES as AUDIO_FRAMES)
 from .asr.realtime import PartialLeakageGuard, remove_cross_role_duplicates
 from .settings import load_glossary
+from .translation import (TRANSLATION_MODELS, DEFAULT_TRANSLATION_MODEL,
+                          LocalEnglishJapaneseTranslator, EnglishTranslationWorker,
+                          translation_model_dir, TranslationRequest)
 from .postprocess.data import _read_jsonl, _read_metadata
 from .postprocess.transcribe import detect_ja_en
 from .postprocess.render import fmt_timestamp
@@ -245,8 +249,11 @@ class MeetingRecorderGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("GijirokuStudio v2 - リモート会議記録システム")
-        self.root.geometry("620x860")
-        self.root.resizable(False, False)
+        width = min(1600, max(1100, self.root.winfo_screenwidth() - 60))
+        height = min(900, max(650, self.root.winfo_screenheight() - 100))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(1100, 650)
+        self.root.resizable(True, True)
 
         self.is_recording = False
         self.stop_event = threading.Event()
@@ -263,6 +270,10 @@ class MeetingRecorderGUI:
         self._rt_detected_lang = None
         self._fast_final_segments = []
         self._fast_refined_segments = []
+        self._translation_worker = None
+        self._translation_model = None
+        self._translation_model_key = None
+        self._transcript_row_counter = 0
         self._recording_dir = None
         self._recording_mon_idx = 0
         self._recording_rect = None   # frozen at record start, like the dHash threshold
@@ -313,6 +324,10 @@ class MeetingRecorderGUI:
         self.REALTIME_BACKEND = "fast_ja_en"
         self.POSTPROCESS_BACKEND = "whisper"
         self.FAST_ASR_THREADS = 4
+        self.RECORD_MICROPHONE = True
+        self.TRANSLATION_ENABLED = False
+        self.TRANSLATION_MODEL = DEFAULT_TRANSLATION_MODEL
+        self.TRANSLATION_THREADS = 1
         self.ECHO_DELAY_MS = 0
 
         # System-wide key for marking an important moment mid-meeting
@@ -332,6 +347,7 @@ class MeetingRecorderGUI:
 
         self._enumerate_audio_devices()
         self._load_settings()
+        self._microphone_gate = MicrophoneGate(self.RECORD_MICROPHONE)
         self.create_widgets()
         self._populate_audio_listbox()
         self._update_region_label()
@@ -346,6 +362,7 @@ class MeetingRecorderGUI:
                     s = json.load(f)
                 self.DHASH_THRESHOLD = int(s.get("dhash_threshold", self.DHASH_THRESHOLD))
                 self.AUDIO_GAIN = float(s.get("audio_gain", self.AUDIO_GAIN))
+                self.RECORD_MICROPHONE = bool(s.get("record_microphone", self.RECORD_MICROPHONE))
                 self.AUDIO_DIAGNOSTIC_SECONDS = max(0, int(s.get(
                     "audio_diagnostic_seconds", self.AUDIO_DIAGNOSTIC_SECONDS)))
                 self.JPEG_QUALITY = int(s.get("jpeg_quality", self.JPEG_QUALITY))
@@ -360,6 +377,10 @@ class MeetingRecorderGUI:
                     "postprocess_backend", self.POSTPROCESS_BACKEND))
                 self.FAST_ASR_THREADS = int(s.get(
                     "fast_asr_threads", self.FAST_ASR_THREADS))
+                self.TRANSLATION_MODEL = str(s.get(
+                    "translation_model", self.TRANSLATION_MODEL))
+                self.TRANSLATION_THREADS = max(1, int(s.get(
+                    "translation_threads", self.TRANSLATION_THREADS)))
                 self.ECHO_DELAY_MS = int(s.get(
                     "echo_delay_ms", self.ECHO_DELAY_MS))
                 self.MARKER_HOTKEY = str(s.get("marker_hotkey", self.MARKER_HOTKEY))
@@ -388,6 +409,7 @@ class MeetingRecorderGUI:
             existing.update({
                 "dhash_threshold": self.DHASH_THRESHOLD,
                 "audio_gain": self.AUDIO_GAIN,
+                "record_microphone": self.RECORD_MICROPHONE,
                 "jpeg_quality": self.JPEG_QUALITY,
                 "whisper_model": self.WHISPER_MODEL,
                 "whisper_device": self.WHISPER_DEVICE,
@@ -396,6 +418,8 @@ class MeetingRecorderGUI:
                 "realtime_backend": self.REALTIME_BACKEND,
                 "postprocess_backend": self.POSTPROCESS_BACKEND,
                 "fast_asr_threads": self.FAST_ASR_THREADS,
+                "translation_model": self.TRANSLATION_MODEL,
+                "translation_threads": self.TRANSLATION_THREADS,
                 "echo_delay_ms": self.ECHO_DELAY_MS,
                 "marker_hotkey": self.MARKER_HOTKEY,
                 "capture_region": self.CAPTURE_REGION,
@@ -425,25 +449,35 @@ class MeetingRecorderGUI:
         menubar.add_cascade(label="記録", menu=menu_rec)
         self.root.config(menu=menubar)
 
-        frame_info = ttk.LabelFrame(self.root, text=" システム概要 ", padding=10)
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        sidebar = ttk.Frame(body)
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        transcripts = ttk.Panedwindow(body, orient="horizontal")
+        transcripts.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=8)
+        self._transcript_panes = transcripts
+
+        frame_info = ttk.LabelFrame(sidebar, text=" システム概要 ", padding=10)
         frame_info.pack(fill="x", padx=15, pady=(8, 4))
-        ttk.Label(frame_info, justify="left", text=(
+        ttk.Label(frame_info, justify="left", wraplength=460, text=(
             "・スピーカー/マイク音声をリアルタイムMP3録音（ffmpegエンコード）\n"
             "・5秒ごとに画面変化を検知し、スライド切替時のみJPEG保存\n"
             "・高負荷モード: ローカルAIでリアルタイム文字起こし"
         )).pack(anchor="w")
 
-        frame_set = ttk.LabelFrame(self.root, text=" 録画設定 ", padding=10)
+        frame_set = ttk.LabelFrame(sidebar, text=" 録画設定 ", padding=10)
         frame_set.pack(fill="x", padx=15, pady=4)
 
         ttk.Label(frame_set, text="会議名:").grid(row=0, column=0, sticky="w", pady=2)
-        self.entry_meeting = ttk.Entry(frame_set, width=44)
+        self.entry_meeting = ttk.Entry(frame_set, width=32)
         self.entry_meeting.grid(row=0, column=1, padx=10, pady=2)
 
         ttk.Label(frame_set, text="対象画面:").grid(row=1, column=0, sticky="nw", pady=2)
         mon_frame = ttk.Frame(frame_set)
         mon_frame.grid(row=1, column=1, padx=10, pady=2, sticky="w")
-        self.combo_monitor = ttk.Combobox(mon_frame, width=42, state="readonly")
+        self.combo_monitor = ttk.Combobox(mon_frame, width=32, state="readonly")
         self.combo_monitor.pack(anchor="w")
         self.combo_monitor.bind("<<ComboboxSelected>>", self._on_monitor_changed)
 
@@ -467,7 +501,7 @@ class MeetingRecorderGUI:
         lb_row.pack(fill="x")
         self._audio_scroll = ttk.Scrollbar(lb_row, orient="vertical")
         self.listbox_audio = tk.Listbox(
-            lb_row, selectmode="extended", height=5, width=52,
+            lb_row, selectmode="extended", height=5, width=42,
             font=("BIZ UDゴシック", 9), exportselection=False,
             yscrollcommand=self._audio_scroll.set)
         self._audio_scroll.config(command=self.listbox_audio.yview)
@@ -487,20 +521,30 @@ class MeetingRecorderGUI:
         self.btn_select_meeting_audio.pack(side="left", padx=(6, 0))
 
         ttk.Label(frame_set, text="動作モード:").grid(row=3, column=0, sticky="w", pady=2)
-        self.combo_mode = ttk.Combobox(frame_set, width=42, state="readonly",
+        self.combo_mode = ttk.Combobox(frame_set, width=32, state="readonly",
             values=["軽量（録音のみ）", "高負荷（リアルタイム文字起こし）"])
         self.combo_mode.grid(row=3, column=1, padx=10, pady=2)
         self.combo_mode.current(0)
         self.combo_mode.bind("<<ComboboxSelected>>", self._on_mode_changed)
 
         ttk.Label(frame_set, text="文字起こし言語:").grid(row=4, column=0, sticky="w", pady=2)
-        self.combo_lang = ttk.Combobox(frame_set, width=42, state="readonly",
+        self.combo_lang = ttk.Combobox(frame_set, width=32, state="readonly",
             values=[label for label, _ in LANG_OPTIONS])
         self.combo_lang.grid(row=4, column=1, padx=10, pady=2)
         self.combo_lang.current(0)
         self.combo_lang.bind("<<ComboboxSelected>>", self._on_lang_changed)
+        self._translation_enabled_var = tk.BooleanVar(value=False)
+        self.chk_translation = ttk.Checkbutton(
+            frame_set, text="英語 → 日本語の翻訳を使う",
+            variable=self._translation_enabled_var, command=self._on_translation_toggle)
+        self.chk_translation.grid(row=5, column=1, padx=10, pady=(6, 2), sticky="w")
+        self._record_microphone_var = tk.BooleanVar(value=self.RECORD_MICROPHONE)
+        self.chk_microphone = ttk.Checkbutton(
+            frame_set, text="マイクを録音",
+            variable=self._record_microphone_var, command=self._on_microphone_toggle)
+        self.chk_microphone.grid(row=6, column=1, padx=10, pady=2, sticky="w")
 
-        frame_level = ttk.Frame(self.root, padding=(15, 2))
+        frame_level = ttk.Frame(sidebar, padding=(15, 2))
         frame_level.pack(fill="x")
         self._show_level_var = tk.BooleanVar(value=True)
         self.chk_level = tk.Checkbutton(
@@ -513,7 +557,7 @@ class MeetingRecorderGUI:
 
         self._detect_monitors()
 
-        frame_ctrl = ttk.Frame(self.root, padding=5)
+        frame_ctrl = ttk.Frame(sidebar, padding=5)
         frame_ctrl.pack(fill="x", padx=15, pady=4)
 
         row_buttons = ttk.Frame(frame_ctrl)
@@ -572,17 +616,29 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 10, "bold"), foreground="#6b7280")
         self.label_status.pack(anchor="w", pady=2)
 
-        frame_log = ttk.LabelFrame(self.root, text=" 動作ログ ", padding=5)
+        frame_log = ttk.LabelFrame(sidebar, text=" 動作ログ ", padding=5)
         frame_log.pack(fill="both", expand=True, padx=15, pady=4)
         self.log_area = scrolledtext.ScrolledText(
-            frame_log, height=7, font=("Consolas", 9), state="disabled")
+            frame_log, height=5, width=44, font=("Consolas", 9), state="disabled", wrap="word")
         self.log_area.pack(fill="both", expand=True)
 
-        frame_tr = ttk.LabelFrame(self.root, text=" 文字起こし（高負荷モード） ", padding=5)
-        frame_tr.pack(fill="both", expand=True, padx=15, pady=(4, 8))
+        frame_tr = ttk.LabelFrame(transcripts, text=" 原文・文字起こし ", padding=5)
+        transcripts.add(frame_tr, weight=1)
         self.transcript_area = scrolledtext.ScrolledText(
-            frame_tr, height=6, font=("BIZ UDゴシック", 10), state="disabled")
+            frame_tr, height=20, width=32, wrap="word",
+            font=("BIZ UDゴシック", 10), state="disabled")
         self.transcript_area.pack(fill="both", expand=True)
+        frame_translation = ttk.LabelFrame(transcripts, text=" 日本語訳・日本語の発言 ", padding=5)
+        transcripts.add(frame_translation, weight=1)
+        self._translation_frame = frame_translation
+        self.translation_area = scrolledtext.ScrolledText(
+            frame_translation, height=20, width=32, wrap="word",
+            font=("BIZ UDゴシック", 10), state="disabled")
+        self.translation_area.pack(fill="both", expand=True)
+        self.translation_area.tag_config("pending", foreground="#9ca3af")
+        self.translation_area.tag_config("translated", foreground="#047857")
+        self.translation_area.tag_config("unavailable", foreground="#b45309")
+        self._set_translation_visible(False)
         self._set_transcript_enabled(False)
 
     # --------------------------------------------------------- Audio device enumeration
@@ -1590,6 +1646,18 @@ class MeetingRecorderGUI:
         combo_post.grid(row=9, column=1, columnspan=2, padx=(10, 0), pady=(10, 4))
         combo_post.current(current_post)
 
+        translation_frame = ttk.LabelFrame(dlg, text=" 英語 → 日本語の字幕翻訳 ", padding=10)
+        translation_frame.pack(padx=15, pady=(0, 10), fill="x")
+        ttk.Label(translation_frame, text="翻訳モデル:").grid(row=1, column=0, sticky="w", pady=4)
+        combo_translation = ttk.Combobox(translation_frame, width=32, state="readonly",
+                                        values=[x[0] for x in TRANSLATION_MODELS])
+        combo_translation.grid(row=1, column=1, padx=(10, 0), pady=4)
+        combo_translation.current(next((i for i, x in enumerate(TRANSLATION_MODELS)
+                                        if x[1] == self.TRANSLATION_MODEL), 0))
+        ttk.Label(translation_frame, text="翻訳はメイン画面のチェックでON/OFF。モデル変更は次の録音から。",
+                  font=("BIZ UDゴシック", 8), foreground="#6b7280").grid(
+                      row=2, column=0, columnspan=2, sticky="w")
+
         # AI summary
         sum_frame = ttk.LabelFrame(dlg, text=" AI要約（後処理） ", padding=15)
         sum_frame.pack(padx=15, pady=(0, 10), fill="x")
@@ -1626,6 +1694,7 @@ class MeetingRecorderGUI:
             self.OCR_ENABLED = var_ocr.get()
             self.REALTIME_BACKEND = REALTIME_BACKENDS[combo_rt.current()][1]
             self.POSTPROCESS_BACKEND = REALTIME_BACKENDS[combo_post.current()][1]
+            self.TRANSLATION_MODEL = TRANSLATION_MODELS[combo_translation.current()][1]
             if old_backend != self.REALTIME_BACKEND:
                 self._preloaded_transcriber = None
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
@@ -1661,9 +1730,8 @@ class MeetingRecorderGUI:
         self._log("設定をデフォルトにリセットしました")
 
     def _set_transcript_enabled(self, on):
-        self.transcript_area.config(
-            state="normal" if on else "disabled",
-            background="#fffef0" if on else "#f3f4f6")
+        for area in (self.transcript_area, self.translation_area):
+            area.config(state="disabled", background="#fffef0" if on else "#f3f4f6")
 
     # -------------------------------------------------------- Language segment log
 
@@ -1774,14 +1842,26 @@ class MeetingRecorderGUI:
         for start, end in zip(ranges[0::2], ranges[1::2]):
             self.transcript_area.delete(start, end)
 
-    def _log_transcript(self, text, speaker=""):
+    def _log_transcript(self, text, speaker="", seconds=None, language="", row_id="",
+                        timestamp="", translation_pending=False, show_translation=True):
         self.transcript_area.config(state="normal")
         self._clear_partial_transcript(speaker)
-        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        ts = timestamp or datetime.datetime.now().strftime('%H:%M:%S')
         who = f" [{speaker}]" if speaker else ""
-        self.transcript_area.insert(tk.END, f"[{ts}]{who} {text}\n")
+        prefix = f"[{ts}]{who} "
+        self.transcript_area.insert(tk.END, prefix + text + "\n")
         self.transcript_area.see(tk.END)
         self.transcript_area.config(state="disabled")
+        if row_id and show_translation:
+            if language == "en":
+                right_text = "翻訳中…" if translation_pending else "英語の翻訳はOFFです"
+                style = "pending" if translation_pending else "unavailable"
+            else:
+                right_text, style = text, "original"
+            self.translation_area.config(state="normal")
+            self.translation_area.insert(tk.END, prefix + right_text + "\n", (row_id, style))
+            self.translation_area.see(tk.END)
+            self.translation_area.config(state="disabled")
 
     def _show_partial_transcript(self, text, stable="", speaker=""):
         self.transcript_area.config(state="normal")
@@ -2245,6 +2325,8 @@ class MeetingRecorderGUI:
     def _mixer_loop_n(self, active, queues, devices=None):
         """Render one shared clock; never append device tails sequentially."""
         sources = [TimelineSource() for _ in queues]
+        microphone_gate = getattr(self, '_microphone_gate', None)
+        kinds = self._recording_processor.kinds
         debug_limit = getattr(self, 'AUDIO_DIAGNOSTIC_SECONDS', 0) * self.TARGET_RATE
         debug_buffers = [bytearray() for _ in queues] if debug_limit else []
         native_mic_buffers = {}
@@ -2276,6 +2358,9 @@ class MeetingRecorderGUI:
                         if item is _EOF:
                             ended[i] = True
                             break
+                        if microphone_gate is not None and kinds[i] == 'mic':
+                            item = CapturePacket(item.start, item.rate,
+                                microphone_gate.filter(item.samples, item.start, item.rate))
                         if (debug_buffers and devices and
                                 devices[i]['kind'] == 'mic'):
                             buf = native_mic_buffers.setdefault(i, bytearray())
@@ -2306,13 +2391,20 @@ class MeetingRecorderGUI:
                 while emitted < limit:
                     blocks = [source.read(origin + emitted / self.TARGET_RATE)
                               for source in sources]
+                    microphone_mask = None
+                    if microphone_gate is not None:
+                        microphone_mask = microphone_gate.mask(
+                            origin + emitted / self.TARGET_RATE, self.TARGET_RATE, AUDIO_FRAMES)
+                        for i in self._recording_processor.mics:
+                            blocks[i] = blocks[i] * microphone_mask[:, None]
                     count = min(AUDIO_FRAMES, limit - emitted)
                     if debug_buffers and emitted < debug_limit:
                         debug_count = min(count, debug_limit - emitted)
                         for buf, block in zip(debug_buffers, blocks):
                             buf.extend(np.clip(block[:debug_count] * 32768,
                                 -32768, 32767).astype(np.int16).tobytes())
-                    raw, own, other = self._recording_processor.process(blocks)
+                    raw, own, other = self._recording_processor.process(
+                        blocks, microphone_mask=microphone_mask)
                     raw, own, other = (x[:count * 4] for x in (raw, own, other))
                     roles = {ROLE_SELF: own, ROLE_OTHER: other}
                     self._update_level(raw)
@@ -2676,6 +2768,7 @@ class MeetingRecorderGUI:
                     os.path.join(dir_name, "transcription_refined.txt"),
                     "w", encoding="utf-8")
             self._transcribe_start = time.time()
+            self._start_translation(dir_name)
             self.root.after(0, self._log, "文字起こしスレッド起動")
             loop = (self._transcribe_fast_loop if self.REALTIME_BACKEND == "fast_ja_en"
                     else self._transcribe_loop)
@@ -2684,7 +2777,108 @@ class MeetingRecorderGUI:
 
         except Exception as e:
             self.root.after(0, self._log, f"[文字起こしエラー] {e}")
+            self._stop_translation()
             self.transcriber = None
+
+    def _start_translation(self, dir_name):
+        self._stop_translation()
+        name = self.TRANSLATION_MODEL
+        threads = self.TRANSLATION_THREADS
+        model_dir = translation_model_dir(name)
+
+        def load_model():
+            key = (name, threads)
+            if self._translation_model_key != key or self._translation_model is None:
+                self._translation_model = None
+                self._translation_model_key = None
+                self._translation_model = LocalEnglishJapaneseTranslator(model_dir, threads)
+                self._translation_model_key = key
+            return self._translation_model
+
+        self._translation_worker = EnglishTranslationWorker(
+            load_model, dir_name,
+            on_result=lambda request, translated: self.root.after(
+                0, self._log_translation, request, translated),
+            on_error=lambda error: self.root.after(0, self._log, f"[翻訳警告] {error}"),
+            model_name=name,
+            on_skipped=lambda request, error: self.root.after(
+                0, self._replace_translation_row, request, error, "unavailable"))
+        self._translation_worker.set_enabled(self.TRANSLATION_ENABLED)
+        if self.TRANSLATION_ENABLED:
+            self.root.after(0, self._log, "英語の確定字幕だけを日本語に翻訳（ローカル）")
+
+    def _on_microphone_toggle(self):
+        self.RECORD_MICROPHONE = self._record_microphone_var.get()
+        self._microphone_gate.set_enabled(self.RECORD_MICROPHONE)
+        self._save_settings()
+        self._log("マイクを録音: " + ("ON" if self.RECORD_MICROPHONE else "OFF（相手の音声は継続）"))
+
+    def _on_translation_toggle(self):
+        self.TRANSLATION_ENABLED = self._translation_enabled_var.get()
+        self._set_translation_visible(self.TRANSLATION_ENABLED)
+        if self._translation_worker is not None:
+            self._translation_worker.set_enabled(self.TRANSLATION_ENABLED)
+        self._log("英語→日本語の翻訳: " + ("ON" if self.TRANSLATION_ENABLED else "OFF"))
+
+    def _set_translation_visible(self, visible):
+        panes = self._transcript_panes
+        frame = self._translation_frame
+        shown = str(frame) in [str(pane) for pane in panes.panes()]
+        if visible and not shown:
+            panes.add(frame, weight=1)
+            def balance_columns():
+                if len(panes.panes()) == 2 and panes.winfo_width() > 1:
+                    panes.sashpos(0, panes.winfo_width() // 2)
+            panes.after_idle(balance_columns)
+        elif not visible and shown:
+            panes.forget(frame)
+
+    def _publish_transcript(self, text, language, seconds, speaker="", kind="final"):
+        self._transcript_row_counter += 1
+        row_id = f"translation_row_{self._transcript_row_counter}"
+        timestamp = datetime.datetime.fromtimestamp(
+            self._record_start + seconds).strftime("%H:%M:%S")
+        enabled = self.TRANSLATION_ENABLED
+        pending = (enabled and language == "en"
+                   and self._translation_worker is not None)
+        self.root.after(0, self._log_transcript, text, speaker, seconds,
+                        language, row_id, timestamp, pending, enabled)
+        if enabled:
+            self._submit_translation(text, language, seconds, speaker, kind, row_id, timestamp)
+
+    def _submit_translation(self, text, language, seconds, speaker="", kind="final",
+                            row_id="", timestamp=""):
+        # The checkbox can change while a background ASR result is being published.
+        if not self.TRANSLATION_ENABLED and language == "en" and row_id:
+            request = TranslationRequest(text, seconds, speaker, row_id, timestamp)
+            self.root.after(0, self._replace_translation_row, request,
+                            "英語の翻訳はOFFです", "unavailable")
+            return
+        if self.TRANSLATION_ENABLED and self._translation_worker is not None:
+            self._translation_worker.submit(text, language, kind=kind,
+                                            seconds=seconds, speaker=speaker,
+                                            row_id=row_id, timestamp=timestamp)
+
+    def _log_translation(self, request, translated):
+        self._replace_translation_row(request, translated, "translated")
+
+    def _replace_translation_row(self, request, text, style):
+        # Late translations replace their placeholder, preserving conversation order.
+        area = self.translation_area
+        ranges = area.tag_ranges(request.row_id)
+        if len(ranges) != 2:
+            return
+        start, end = str(ranges[0]), str(ranges[1])
+        area.config(state="normal")
+        area.delete(start, end)
+        who = f" [{request.speaker}]" if request.speaker else ""
+        area.insert(start, f"[{request.timestamp}]{who} {text}\n", (request.row_id, style))
+        area.config(state="disabled")
+
+    def _stop_translation(self):
+        if self._translation_worker is not None:
+            self._translation_worker.close()
+            self._translation_worker = None
 
     def _record_fast_results(self, events, speaker=""):
         for result in events:
@@ -2712,7 +2906,9 @@ class MeetingRecorderGUI:
                     self.refined_transcription_file.flush()
                 continue
             self._fast_final_segments.append(result)
-            self.root.after(0, self._log_transcript, text, speaker)
+            self._publish_transcript(text, result.language,
+                                     result.start_sample / self.TRANSCRIBE_RATE,
+                                     speaker, result.kind)
             if self.transcription_file:
                 elapsed = time.time() - self._transcribe_start
                 who = f"[{speaker}] " if speaker else ""
@@ -2879,7 +3075,9 @@ class MeetingRecorderGUI:
                 text = seg.text.strip()
                 if not text:
                     continue
-                self.root.after(0, self._log_transcript, text)
+                self._publish_transcript(text, lang, max(
+                    0.0, time.time() - self._transcribe_start - len(clip) / self.TRANSCRIBE_RATE
+                    + seg.start))
                 if self.transcription_file:
                     elapsed = time.time() - self._transcribe_start
                     self.transcription_file.write(f"[{elapsed:.1f}s] {text}\n")
@@ -2960,6 +3158,7 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
         if self._transcribe_thread is not None:
             self._transcribe_thread.join()
             self._transcribe_thread = None
+        self._stop_translation()
         if self.REALTIME_BACKEND == "fast_ja_en":
             try:
                 self._write_fast_final_outputs()

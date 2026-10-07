@@ -182,7 +182,7 @@ class RecordingProcessor:
         self.speaker_mixer = DuplicateMixer(len(self.speakers), threshold=0.92)
         self.limiter = 1.0
 
-    def process(self, blocks):
+    def process(self, blocks, microphone_mask=None):
         speaker_blocks = [blocks[i] for i in self.speakers]
         # AEC must see every physical render path, including mirrored speakers.
         # Deduplication changes only the saved mix, never the echo reference.
@@ -217,6 +217,8 @@ class RecordingProcessor:
                     raise RuntimeError('AEC returned non-finite audio')
             microphones.append(near)
         own = self.mic_mixer.process(microphones)
+        if microphone_mask is not None:
+            own = own * microphone_mask[:, None]
         other = self.speaker_mixer.process(speaker_blocks)
         mix = own + other
         peak = max(float(np.max(np.abs(x))) for x in (mix, own, other)) * self.gain

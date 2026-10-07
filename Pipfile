@@ -14,6 +14,13 @@ scipy = "*"
 faster-whisper = "*"
 pywebrtc-audio = "==0.1.0"
 
+[local]
+# 初期導入で使うローカルASR・英日翻訳。変換専用ライブラリは含めない。
+sherpa-onnx = "==1.13.6"
+ctranslate2 = "==4.8.2"
+sentencepiece = "==0.2.2"
+sacremoses = "==0.2.0"
+
 [optional]
 # 高速な日本語/英語ASR（リアルタイム・後処理共通、setup_fast_asr.py でも導入可能）
 sherpa-onnx = "==1.13.6"

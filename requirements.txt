@@ -1,0 +1,23 @@
+# Runtime dependencies (Python 3.13).
+# Install: python -m pip install -r requirements.txt
+# Torch / Transformers are used only in a temporary model conversion environment.
+mss==10.2.0
+pillow==12.3.0
+imagehash==4.3.2
+pyaudiowpatch==0.2.12.8
+sounddevice==0.5.6
+numpy==2.5.3
+scipy==1.18.1
+faster-whisper==1.2.1
+pywebrtc-audio==0.1.0
+ctranslate2==4.8.2
+
+# Local Japanese/English recognition and English-to-Japanese translation.
+sherpa-onnx==1.13.6
+sentencepiece==0.2.2
+sacremoses==0.2.0
+
+# Optional features: install only when needed.
+# python-docx  (DOCX export)
+# rapidocr-onnxruntime  (OCR fallback)
+# anthropic  (Claude summaries)
