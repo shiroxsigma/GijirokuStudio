@@ -458,6 +458,9 @@ class MeetingRecorderGUI:
         transcripts = ttk.Panedwindow(body, orient="horizontal")
         transcripts.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=8)
         self._transcript_panes = transcripts
+        self._translation_layout_pending = False
+        transcripts.bind("<Map>", self._on_transcript_layout, add="+")
+        transcripts.bind("<Configure>", self._on_transcript_layout, add="+")
 
         frame_info = ttk.LabelFrame(sidebar, text=" システム概要 ", padding=10)
         frame_info.pack(fill="x", padx=15, pady=(8, 4))
@@ -2824,14 +2827,29 @@ class MeetingRecorderGUI:
         panes = self._transcript_panes
         frame = self._translation_frame
         shown = str(frame) in [str(pane) for pane in panes.panes()]
-        if visible and not shown:
-            panes.add(frame, weight=1)
-            def balance_columns():
-                if len(panes.panes()) == 2 and panes.winfo_width() > 1:
-                    panes.sashpos(0, panes.winfo_width() // 2)
-            panes.after_idle(balance_columns)
-        elif not visible and shown:
+        self._translation_layout_pending = visible
+        if visible:
+            if not shown:
+                panes.add(frame, weight=1)
+            panes.after_idle(self._balance_translation_columns)
+        elif shown:
             panes.forget(frame)
+
+    def _on_transcript_layout(self, event):
+        if self._translation_layout_pending:
+            self._transcript_panes.after_idle(self._balance_translation_columns)
+
+    def _balance_translation_columns(self):
+        panes = self._transcript_panes
+        if not self._translation_layout_pending or not panes.winfo_ismapped():
+            return
+        # Adding a pane schedules further geometry work. Finish it before setting
+        # the sash, or Tk can overwrite the position and leave the new pane at 1px.
+        # Clear the flag first so Configure events cannot re-enter this adjustment.
+        self._translation_layout_pending = False
+        panes.update_idletasks()
+        if len(panes.panes()) == 2 and panes.winfo_width() > 1:
+            panes.sashpos(0, panes.winfo_width() // 2)
 
     def _publish_transcript(self, text, language, seconds, speaker="", kind="final"):
         self._transcript_row_counter += 1

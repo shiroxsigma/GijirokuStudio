@@ -274,6 +274,38 @@ class BilingualDisplayTests(unittest.TestCase):
         self.assertIn("日本語です。", gui.transcript_area.get("1.0", "end-1c"))
         self.assertEqual(gui.translation_area.get("1.0", "end-1c"), "")
 
+    def test_enabling_translation_opens_both_columns_after_layout(self):
+        from unittest.mock import patch
+        from gijiroku.gui import MeetingRecorderGUI
+        with patch.object(MeetingRecorderGUI, "_enumerate_audio_devices"), \
+             patch.object(MeetingRecorderGUI, "_populate_audio_listbox"), \
+             patch.object(MeetingRecorderGUI, "_detect_monitors"), \
+             patch.object(MeetingRecorderGUI, "_tick_level_meter"):
+            gui = MeetingRecorderGUI(self.root)
+        gui.chk_translation.invoke()
+        self.root.update_idletasks()
+        self.root.deiconify()
+        self.root.update()
+        panes = gui._transcript_panes
+        self.assertGreater(gui._translation_frame.winfo_width(), panes.winfo_width() * .4)
+        gui.chk_translation.invoke()
+        self.root.update()
+        for _ in range(3):
+            gui.chk_translation.invoke()
+            self.root.update()
+            width = panes.winfo_width()
+            self.assertGreater(gui._translation_frame.winfo_width(), width * .4)
+            self.assertLess(panes.sashpos(0), width * .6)
+            self.assertGreater(panes.sashpos(0), width * .4)
+            # A later resize must preserve a user's manual column adjustment.
+            panes.sashpos(0, int(width * .65))
+            self.root.geometry(f"{self.root.winfo_width() - 10}x{self.root.winfo_height()}")
+            self.root.update()
+            self.assertGreater(panes.sashpos(0), panes.winfo_width() * .6)
+            gui.chk_translation.invoke()
+            self.root.update()
+            self.assertEqual(len(panes.panes()), 1)
+
     def test_late_translation_keeps_order_timestamp_and_speaker(self):
         gui = self.gui
         gui._log_transcript("Hello", "相手", 1, "en", "row1", "12:30:01", True)
