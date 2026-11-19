@@ -61,6 +61,12 @@ REALTIME_BACKENDS = [
     ("従来（faster-whisper）", "whisper"),
 ]
 
+CAPTION_MODES = (
+    ("途中＋確定", "both"),
+    ("途中のみ（確定なし）", "partial_only"),
+    ("確定のみ", "final_only"),
+)
+
 LANG_OPTIONS = [
     ("自動（日本語/英語）", "auto"),
     ("日本語", "ja"), ("English", "en"), ("中文", "zh"), ("한국어", "ko"),
@@ -249,6 +255,8 @@ def _com_uninitialize():
 
 
 class MeetingRecorderGUI:
+    REALTIME_CAPTION_MODE = "both"
+
     def __init__(self, root):
         self.root = root
         self.root.title("GijirokuStudio v2 - リモート会議記録システム")
@@ -378,6 +386,9 @@ class MeetingRecorderGUI:
                     "realtime_whisper_model", self.REALTIME_WHISPER_MODEL))
                 self.REALTIME_BACKEND = str(s.get(
                     "realtime_backend", self.REALTIME_BACKEND))
+                caption_mode = s.get("realtime_caption_mode")
+                if any(caption_mode == value for _, value in CAPTION_MODES):
+                    self.REALTIME_CAPTION_MODE = caption_mode
                 self.POSTPROCESS_BACKEND = str(s.get(
                     "postprocess_backend", self.POSTPROCESS_BACKEND))
                 self.FAST_ASR_THREADS = int(s.get(
@@ -421,6 +432,7 @@ class MeetingRecorderGUI:
                 "whisper_compute": self.WHISPER_COMPUTE,
                 "realtime_whisper_model": self.REALTIME_WHISPER_MODEL,
                 "realtime_backend": self.REALTIME_BACKEND,
+                "realtime_caption_mode": self.REALTIME_CAPTION_MODE,
                 "postprocess_backend": self.POSTPROCESS_BACKEND,
                 "fast_asr_threads": self.FAST_ASR_THREADS,
                 "translation_model": self.TRANSLATION_MODEL,
@@ -634,6 +646,16 @@ class MeetingRecorderGUI:
 
         frame_tr = ttk.LabelFrame(transcripts, text=" 原文・文字起こし ", padding=5)
         transcripts.add(frame_tr, weight=1)
+        caption_controls = ttk.Frame(frame_tr)
+        caption_controls.pack(fill="x", pady=(0, 4))
+        ttk.Label(caption_controls, text="字幕表示").pack(side="left")
+        self.combo_caption = ttk.Combobox(
+            caption_controls, state="readonly", width=18,
+            values=[label for label, _ in CAPTION_MODES])
+        self.combo_caption.current(next(i for i, (_, mode) in enumerate(CAPTION_MODES)
+                                        if mode == self.REALTIME_CAPTION_MODE))
+        self.combo_caption.pack(side="left", padx=5)
+        self.combo_caption.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
         self.transcript_area = scrolledtext.ScrolledText(
             frame_tr, height=20, width=32, wrap="word",
             font=("BIZ UDゴシック", 10), state="disabled")
@@ -1869,6 +1891,15 @@ class MeetingRecorderGUI:
         self.log_area.see(tk.END)
         self.log_area.config(state="disabled")
 
+    def _on_caption_mode_change(self, event):
+        self.REALTIME_CAPTION_MODE = CAPTION_MODES[self.combo_caption.current()][1]
+        if self.REALTIME_CAPTION_MODE == "final_only":
+            self.transcript_area.config(state="normal")
+            for speaker in ("", ROLE_SELF, ROLE_OTHER):
+                self._clear_partial_transcript(speaker)
+            self.transcript_area.config(state="disabled")
+        self._save_settings()
+
     def _clear_partial_transcript(self, speaker=""):
         tag = "partial_" + (speaker or "mixed")
         ranges = self.transcript_area.tag_ranges(tag)
@@ -1877,14 +1908,15 @@ class MeetingRecorderGUI:
 
     def _log_transcript(self, text, speaker="", seconds=None, language="", row_id="",
                         timestamp="", translation_pending=False, show_translation=True):
-        self.transcript_area.config(state="normal")
-        self._clear_partial_transcript(speaker)
         ts = timestamp or datetime.datetime.now().strftime('%H:%M:%S')
         who = f" [{speaker}]" if speaker else ""
         prefix = f"[{ts}]{who} "
-        self.transcript_area.insert(tk.END, prefix + text + "\n")
-        self.transcript_area.see(tk.END)
-        self.transcript_area.config(state="disabled")
+        if self.REALTIME_CAPTION_MODE != "partial_only":
+            self.transcript_area.config(state="normal")
+            self._clear_partial_transcript(speaker)
+            self.transcript_area.insert(tk.END, prefix + text + "\n")
+            self.transcript_area.see(tk.END)
+            self.transcript_area.config(state="disabled")
         if row_id and show_translation:
             if language == "en":
                 right_text = "翻訳中…" if translation_pending else "英語の翻訳はOFFです"
@@ -1897,6 +1929,8 @@ class MeetingRecorderGUI:
             self.translation_area.config(state="disabled")
 
     def _show_partial_transcript(self, text, stable="", speaker=""):
+        if self.REALTIME_CAPTION_MODE == "final_only":
+            return
         self.transcript_area.config(state="normal")
         self._clear_partial_transcript(speaker)
         tag = "partial_" + (speaker or "mixed")
@@ -1916,6 +1950,8 @@ class MeetingRecorderGUI:
         self.transcript_area.config(state="disabled")
 
     def _log_refined_transcript(self, text, speaker=""):
+        if self.REALTIME_CAPTION_MODE != "both":
+            return
         self.transcript_area.config(state="normal")
         who = f" [{speaker}]" if speaker else ""
         self.transcript_area.insert(tk.END, f"  ↳ 補正{who}: {text}\n", "refine")
@@ -3046,14 +3082,17 @@ class MeetingRecorderGUI:
         elif old == 2 and backlog <= 1.5:
             self._asr_load_level = 1
             self._asr_backlog_check = (now, backlog)
-        if old == self._asr_load_level:
-            return
+        mode = self.REALTIME_CAPTION_MODE
+        partials = mode == "partial_only" or (mode == "both" and self._asr_load_level < 2)
         for session in sessions.values():
             session.defer_refinement = self._asr_load_level >= 1
-            session.partials_enabled = self._asr_load_level < 2
-        labels = ("通常（途中字幕1秒）", "補正は録音後・途中字幕あり", "補正は録音後・確定字幕のみ")
+            session.partials_enabled = partials
+        if old == self._asr_load_level:
+            return
+        refinement = "補正は録音後" if self._asr_load_level else "通常補正"
+        drafts = "途中字幕あり" if partials else "途中字幕なし"
         self.root.after(0, self._log,
-            f"ASR負荷調整: {labels[self._asr_load_level]}（未処理音声 {backlog:.1f}秒）")
+            f"ASR負荷調整: {refinement}・{drafts}（未処理音声 {backlog:.1f}秒）")
 
     def _transcribe_fast_loop(self):
         """Feed mixed or role-separated PCM with adaptive partial decoding."""
@@ -3117,6 +3156,8 @@ class MeetingRecorderGUI:
         chunk_samples = int(self.TRANSCRIBE_RATE * self.TRANSCRIBE_CHUNK_SECONDS)
         overlap_samples = int(self.TRANSCRIBE_RATE * self.TRANSCRIBE_OVERLAP_SECONDS)
         min_flush_samples = int(self.TRANSCRIBE_RATE * 0.5)
+        draft_interval = 2 * self.TRANSCRIBE_RATE
+        next_draft = draft_interval
 
         buf = np.zeros(0, dtype=np.float32)
         last_lang = None
@@ -3162,6 +3203,14 @@ class MeetingRecorderGUI:
                     clip = buf[:chunk_samples]
                     last_lang = self._transcribe_chunk(clip, last_lang)
                     buf = buf[max(0, chunk_samples - overlap_samples):]
+                    next_draft = overlap_samples + draft_interval
+
+                # Each queued packet normally holds 100 ms. Give complete
+                # chunks priority when inference falls behind live capture.
+                if (self.REALTIME_CAPTION_MODE == "partial_only" and self.is_recording
+                        and len(buf) >= next_draft and self.transcribe_queue.qsize() < 10):
+                    next_draft = len(buf) + draft_interval
+                    self._transcribe_chunk(buf, last_lang, draft=True)
             except Exception as e:
                 self.root.after(0, self._log, f"[文字起こし処理エラー] {e}")
 
@@ -3171,12 +3220,18 @@ class MeetingRecorderGUI:
             except Exception as e:
                 self.root.after(0, self._log, f"[バッファフラッシュ警告] {e}")
 
-    def _transcribe_chunk(self, clip, prev_lang):
-        """Transcribe one ~5s 16kHz mono chunk; return the language used."""
+    def _transcribe_chunk(self, clip, prev_lang, *, draft=False):
+        """Decode a 16 kHz clip for a live preview or a saved transcript."""
         try:
             lang = detect_ja_en(self.transcriber, clip) if self._rt_lang is None else self._rt_lang
             segments, info = self.transcriber.transcribe(
                 clip, language=lang, vad_filter=True, beam_size=1)
+            if draft:
+                # Whisper keeps leading spaces between words across segments.
+                text = "".join(seg.text for seg in segments).strip()
+                if text:
+                    self.root.after(0, self._show_partial_transcript, text)
+                return lang
             for seg in segments:
                 text = seg.text.strip()
                 if not text:
