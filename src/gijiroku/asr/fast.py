@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import os
+import tempfile
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,7 +32,7 @@ class FastASREvent:
 class FastJapaneseEnglishASR:
     sample_rate = 16000
     window_size = 512
-    partial_every = 0.5
+    partial_every = 1.0
     partial_window = 8.0
     refine_gap = 2.0
     refine_max = 25.0
@@ -89,6 +90,9 @@ class FastJapaneseEnglishASR:
         self._partial_prev = ""
         self._partial_stable = ""
         self.partials_enabled = True
+        self.defer_refinement = False
+        self._deferred_audio = None
+        self._deferred_groups = []
 
     def clone_session(self):
         """New independent VAD/timeline sharing the heavy recognizers."""
@@ -237,15 +241,64 @@ class FastJapaneseEnglishASR:
         langs = [x[2] for x in group]
         lang = max(set(langs), key=langs.count)
         fast = " ".join(x[3] for x in group)
+        event = FastASREvent("refine", fast, lang, group[0][0], last_end)
+        samples = None
         # Do not destroy genuine code-switching by forcing a majority model.
-        if len(set(langs)) > 1:
-            text = fast
-        else:
+        if len(set(langs)) == 1:
             samples = self._history_slice(max(0, group[0][0] - self.sample_rate), last_end)
-            text = self._decode_lang(samples, lang)
-            if len(text) < 0.7 * len(fast):
-                text = fast
-        return [FastASREvent("refine", text, lang, group[0][0], last_end)] if text else []
+        if self.defer_refinement:
+            offset = size = 0
+            if samples is not None:
+                try:
+                    if self._deferred_audio is None:
+                        self._deferred_audio = tempfile.TemporaryFile()
+                    offset = self._deferred_audio.tell()
+                    size = self._deferred_audio.write(memoryview(samples))
+                except OSError as exc:
+                    # Live finals are already decoded; losing a correction
+                    # must not discard the other events from this accept().
+                    print(f"[高速ASR] 補正用音声を一時保存できません: {exc}")
+                    return []
+            self._deferred_groups.append((event, offset, size))
+            return []
+        return [self._refine_event(event, samples)]
+
+    def _refine_event(self, event, samples):
+        if samples is not None:
+            text = self._decode_lang(samples, event.language)
+            if len(text) >= 0.7 * len(event.text):
+                event.text = text
+        return event
+
+    @property
+    def pending_refinement_count(self):
+        return len(self._deferred_groups)
+
+    def drain_deferred_refinements(self):
+        """Decode queued groups after all live streams have emitted their finals."""
+        try:
+            for event, offset, size in self._deferred_groups:
+                try:
+                    samples = None
+                    if size:
+                        self._deferred_audio.seek(offset)
+                        audio = self._deferred_audio.read(size)
+                        if len(audio) != size:
+                            raise OSError("補正用音声を読み取れません")
+                        samples = np.frombuffer(audio, dtype=np.float32)
+                    refined = self._refine_event(event, samples)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(f"[高速ASR] 区間 {event.start_sample / self.sample_rate:.1f}s の補正をスキップ: {exc}")
+                    continue
+                yield refined
+        finally:
+            self.close_deferred_refinements()
+
+    def close_deferred_refinements(self):
+        self._deferred_groups.clear()
+        if self._deferred_audio is not None:
+            self._deferred_audio.close()
+            self._deferred_audio = None
 
     def _drain(self, lang_hint=None):
         out = []

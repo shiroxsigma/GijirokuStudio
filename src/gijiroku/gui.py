@@ -30,6 +30,7 @@ from .audio.clock import CaptureClock, CapturePacket
 from .audio.microphone import MicrophoneGate
 from .audio.pipeline import (TimelineSource, RecordingProcessor,
                         RATE as AUDIO_RATE, FRAMES as AUDIO_FRAMES)
+from .asr.backlog import AudioBacklogQueue
 from .asr.realtime import PartialLeakageGuard, remove_cross_role_duplicates
 from .asr.whisper import load_whisper_model
 from .settings import load_glossary
@@ -257,6 +258,7 @@ class MeetingRecorderGUI:
         self.root.resizable(True, True)
 
         self.is_recording = False
+        self._close_after_save = False
         self.stop_event = threading.Event()
         self.ffmpeg_proc = None       # _PcmWriter for the mixed audio
         self._role_writers = {}       # role -> _PcmWriter (speaker separation)
@@ -298,7 +300,7 @@ class MeetingRecorderGUI:
         self.transcribe_role_queues = {}
         self._audio_finished = threading.Event()
         self._leakage_guard = PartialLeakageGuard()
-        self._asr_load_ema = 0.0
+        self._asr_backlog_check = None
         self._asr_load_level = 0
         # PortAudio init/open/terminate are not thread-safe: with several devices
         # starting at once, unrelated opens fail with bogus "invalid sample rate".
@@ -1989,7 +1991,19 @@ class MeetingRecorderGUI:
             self.label_status.config(text="ステータス: 保存処理中...", foreground="#f59e0b")
             threading.Thread(target=self._async_cleanup, daemon=True).start()
 
+    def close(self):
+        if self.is_recording:
+            self._close_after_save = True
+            self._toggle_recording()
+        elif self.stop_event.is_set():
+            self._close_after_save = True
+        else:
+            self.root.destroy()
+
     def _reset_ui(self):
+        if self._close_after_save:
+            self.root.destroy()
+            return
         self.is_recording = False
         self.stop_event.clear()
         self._audio_level = 0.0
@@ -2048,11 +2062,15 @@ class MeetingRecorderGUI:
         n_mic = sum(1 for d in selected if d["kind"] == "mic")
         n_spk = sum(1 for d in selected if d["kind"] == "speaker")
         separate = n > 1 and n_mic >= 1 and n_spk >= 1
-        if mode_full and self.REALTIME_BACKEND == "fast_ja_en" and separate:
-            self.transcribe_role_queues = {
-                ROLE_SELF: queue.Queue(maxsize=400),
-                ROLE_OTHER: queue.Queue(maxsize=400),
-            }
+        if mode_full and self.REALTIME_BACKEND == "fast_ja_en":
+            if separate:
+                self.transcribe_role_queues = {
+                    role: AudioBacklogQueue(400, self.TARGET_RATE, self.TRANSCRIBE_RATE)
+                    for role in (ROLE_SELF, ROLE_OTHER)
+                }
+            else:
+                self.transcribe_queue = AudioBacklogQueue(
+                    400, self.TARGET_RATE, self.TRANSCRIBE_RATE)
         elif mode_full:
             self.transcribe_queue = queue.Queue(maxsize=400)
 
@@ -2170,7 +2188,7 @@ class MeetingRecorderGUI:
         """Run teardown in background so UI stays responsive."""
         # Wait for pipeline thread to finish setting _pipeline_ctx
         if self._pipeline_thread:
-            self._pipeline_thread.join(timeout=10)
+            self._pipeline_thread.join()
             self._pipeline_thread = None
         ctx = self._pipeline_ctx
         if ctx is None:
@@ -2241,7 +2259,7 @@ class MeetingRecorderGUI:
                 "選択したデバイスがすべて無音／使用不可の可能性があります。\n"
                 "動作ログの「[スキップ]」「[キャプチャエラー]」を確認してください。\n\n"
                 f"フォルダー:\n{dir_name}")
-        else:
+        elif not self._close_after_save:
             final_html = os.path.join(dir_name, "transcription_final.html")
             html_note = ("\n\n補正済みHTML: transcription_final.html"
                          if os.path.exists(final_html) else "")
@@ -2770,7 +2788,7 @@ class MeetingRecorderGUI:
             self._fast_final_segments = []
             self._fast_refined_segments = []
             self._leakage_guard = PartialLeakageGuard()
-            self._asr_load_ema = 0.0
+            self._asr_backlog_check = None
             self._asr_load_level = 0
             if self.REALTIME_BACKEND == "fast_ja_en" and self.transcribe_role_queues:
                 base = self.transcriber
@@ -2931,14 +2949,8 @@ class MeetingRecorderGUI:
                                 text, result.stable_text, speaker)
                 continue
             if result.kind == "refine":
-                self._fast_refined_segments.append(result)
+                self._save_fast_refinement(result, speaker)
                 self.root.after(0, self._log_refined_transcript, text, speaker)
-                if self.refined_transcription_file:
-                    elapsed = time.time() - self._transcribe_start
-                    who = f"[{speaker}] " if speaker else ""
-                    self.refined_transcription_file.write(
-                        f"[{elapsed:.1f}s] {who}{text}\n")
-                    self.refined_transcription_file.flush()
                 continue
             self._fast_final_segments.append(result)
             self._publish_transcript(text, result.language,
@@ -2955,28 +2967,43 @@ class MeetingRecorderGUI:
                 label = "日本語" if result.language == "ja" else "English"
                 self._write_language_event(result.language, label)
 
-    def _update_asr_load(self, ratio, sessions):
-        """Adapt draft frequency with hysteresis; finals are never disabled."""
-        self._asr_load_ema = (ratio if self._asr_load_ema == 0
-                              else self._asr_load_ema * 0.85 + ratio * 0.15)
+    def _save_fast_refinement(self, result, speaker):
+        result.speaker = speaker
+        self._fast_refined_segments.append(result)
+        if self.refined_transcription_file:
+            elapsed = result.start_sample / self.TRANSCRIBE_RATE
+            who = f"[{speaker}] " if speaker else ""
+            self.refined_transcription_file.write(f"[{elapsed:.1f}s] {who}{result.text.strip()}\n")
+            self.refined_transcription_file.flush()
+
+    def _update_asr_load(self, queues, sessions):
+        """Shed refinement first, then drafts if the audio backlog isn't clearing."""
+        # Microphone and loopback advance on the same recording timeline.
+        backlog = max((q.pending_seconds for q in queues.values() if q is not None), default=0)
         old = self._asr_load_level
-        if self._asr_load_level == 0 and self._asr_load_ema > 0.55:
+        now = time.monotonic()
+        if backlog <= 0.5:
+            self._asr_load_level = 0
+        elif old == 0 and backlog >= 1.0:
             self._asr_load_level = 1
-        elif self._asr_load_level == 1:
-            if self._asr_load_ema > 0.90:
-                self._asr_load_level = 2
-            elif self._asr_load_ema < 0.40:
-                self._asr_load_level = 0
-        elif self._asr_load_level == 2 and self._asr_load_ema < 0.70:
+            self._asr_backlog_check = (now, backlog)
+        elif old == 1:
+            checked, previous = self._asr_backlog_check
+            if now - checked >= 1.0:
+                if backlog >= 3.0 and backlog >= previous:
+                    self._asr_load_level = 2
+                self._asr_backlog_check = (now, backlog)
+        elif old == 2 and backlog <= 1.5:
             self._asr_load_level = 1
+            self._asr_backlog_check = (now, backlog)
+        if old == self._asr_load_level:
+            return
         for session in sessions.values():
+            session.defer_refinement = self._asr_load_level >= 1
             session.partials_enabled = self._asr_load_level < 2
-            session.partial_every = 1.0 if self._asr_load_level == 1 else 0.5
-        if old != self._asr_load_level:
-            labels = ("通常（暫定0.5秒）", "負荷軽減（暫定1秒）", "高負荷（確定のみ）")
-            self.root.after(0, self._log,
-                f"ASR負荷調整: {labels[self._asr_load_level]} "
-                f"(RTF={self._asr_load_ema:.2f})")
+        labels = ("通常（途中字幕1秒）", "補正は録音後・途中字幕あり", "補正は録音後・確定字幕のみ")
+        self.root.after(0, self._log,
+            f"ASR負荷調整: {labels[self._asr_load_level]}（未処理音声 {backlog:.1f}秒）")
 
     def _transcribe_fast_loop(self):
         """Feed mixed or role-separated PCM with adaptive partial decoding."""
@@ -2991,6 +3018,7 @@ class MeetingRecorderGUI:
 
         while (not self._audio_finished.is_set()
                or any(q is not None and not q.empty() for q in queues.values())):
+            self._update_asr_load(queues, sessions)
             got = False
             # Decode the clean far-end reference first. Its text can then guard
             # the mic result from being displayed as a leaked "self" partial.
@@ -3005,22 +3033,15 @@ class MeetingRecorderGUI:
                     continue
                 got = True
                 try:
-                    t0 = time.perf_counter()
                     if isinstance(pcm, np.ndarray):
                         mono_16k = pcm.astype(np.float32, copy=False)
-                        mono = mono_16k
-                        source_rate = self.TRANSCRIBE_RATE
                     else:
                         samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
                         mono = samples.reshape(-1, 2).mean(axis=1) if len(samples) >= 2 else samples
                         mono_16k = resample_poly(
                             mono, self.TRANSCRIBE_RATE, self.TARGET_RATE).astype(np.float32)
-                        source_rate = self.TARGET_RATE
                     self._record_fast_results(
                         sessions[speaker].accept(mono_16k, self._rt_lang), speaker)
-                    audio_s = max(len(mono) / source_rate, 0.001)
-                    self._update_asr_load(
-                        (time.perf_counter() - t0) / audio_s, sessions)
                 except Exception as e:
                     self.root.after(0, self._log, f"[高速文字起こし処理エラー] {e}")
             if not got:
@@ -3194,7 +3215,21 @@ document.querySelectorAll('.line').forEach(x=>x.addEventListener('click',()=>{{a
             self._transcribe_thread.join()
             self._transcribe_thread = None
         self._stop_translation()
-        if self.REALTIME_BACKEND == "fast_ja_en":
+        if self.refined_transcription_file is not None and self.transcriber is not None:
+            sessions = (self.transcriber if isinstance(self.transcriber, dict)
+                        else {"": self.transcriber})
+            pending = sum(session.pending_refinement_count for session in sessions.values())
+            if pending:
+                self.root.after(0, self.label_status.config,
+                                {"text": f"ステータス: 保留した字幕を補正中（{pending}件）"})
+            for speaker, session in sessions.items():
+                try:
+                    for event in session.drain_deferred_refinements():
+                        self._save_fast_refinement(event, speaker)
+                except Exception as e:
+                    self.root.after(0, self._log, f"[録音後の字幕補正エラー] {e}")
+                finally:
+                    session.close_deferred_refinements()
             try:
                 self._write_fast_final_outputs()
             except Exception as e:

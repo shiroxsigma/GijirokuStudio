@@ -39,13 +39,5 @@ if __name__ == "__main__":
         root = tk.Tk()
         app = MeetingRecorderGUI(root)
 
-        def _on_close():
-            if app.is_recording:
-                app.is_recording = False
-                app.stop_event.set()
-                root.after(2000, root.destroy)
-            else:
-                root.destroy()
-
-        root.protocol("WM_DELETE_WINDOW", _on_close)
+        root.protocol("WM_DELETE_WINDOW", app.close)
         root.mainloop()
