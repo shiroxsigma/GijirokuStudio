@@ -31,6 +31,7 @@ from .audio.microphone import MicrophoneGate
 from .audio.pipeline import (TimelineSource, RecordingProcessor,
                         RATE as AUDIO_RATE, FRAMES as AUDIO_FRAMES)
 from .asr.realtime import PartialLeakageGuard, remove_cross_role_duplicates
+from .asr.whisper import load_whisper_model
 from .settings import load_glossary
 from .translation import (TRANSLATION_MODELS, DEFAULT_TRANSLATION_MODEL,
                           LocalEnglishJapaneseTranslator, EnglishTranslationWorker,
@@ -946,27 +947,33 @@ class MeetingRecorderGUI:
             self._preload_model()
 
     def _preload_model(self):
+        backend = self.REALTIME_BACKEND
+        device, compute = self.WHISPER_DEVICE, self.WHISPER_COMPUTE
+
+        def _ready(model, message):
+            if (backend, device, compute) == (
+                    self.REALTIME_BACKEND, self.WHISPER_DEVICE, self.WHISPER_COMPUTE):
+                self._preloaded_transcriber = model
+                self._log(message)
+
         def _load():
             try:
-                if self.REALTIME_BACKEND == "fast_ja_en":
+                if backend == "fast_ja_en":
                     from .asr.fast import FastJapaneseEnglishASR
                     self.root.after(0, self._log,
                         "高速日本語/英語モデルを事前読み込み中...")
                     model_dir = MODELS_DIR
                     hotwords, replacements = self._prepare_fast_glossary(model_dir)
-                    self._preloaded_transcriber = FastJapaneseEnglishASR(
+                    model = FastJapaneseEnglishASR(
                         model_dir, threads=self.FAST_ASR_THREADS,
                         hotwords_file=hotwords, replacements=replacements)
-                    self.root.after(0, self._log, "高速日本語/英語モデル読み込み完了")
+                    self.root.after(0, _ready, model, "高速日本語/英語モデル読み込み完了")
                 else:
-                    from faster_whisper import WhisperModel
                     self.root.after(0, self._log,
                         f"文字起こしモデルを事前読み込み中... ({self.REALTIME_WHISPER_MODEL})")
-                    self._preloaded_transcriber = WhisperModel(
-                        self.REALTIME_WHISPER_MODEL,
-                        device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
-                    self.root.after(0, self._log,
-                        f"文字起こしモデル読み込み完了 ({self.REALTIME_WHISPER_MODEL})")
+                    model = load_whisper_model(self.REALTIME_WHISPER_MODEL, device, compute)
+                    self.root.after(0, _ready, model,
+                        f"文字起こしモデル読み込み完了 ({self.REALTIME_WHISPER_MODEL}, {device})")
             except Exception as e:
                 self.root.after(0, self._log, f"[事前読み込みエラー] {e}")
         threading.Thread(target=_load, daemon=True).start()
@@ -1649,6 +1656,13 @@ class MeetingRecorderGUI:
         combo_post.grid(row=9, column=1, columnspan=2, padx=(10, 0), pady=(10, 4))
         combo_post.current(current_post)
 
+        ttk.Label(frame, text="Whisper 実行デバイス:").grid(
+            row=10, column=0, sticky="w", pady=4)
+        device_var = tk.StringVar(value=self.WHISPER_DEVICE)
+        ttk.Combobox(frame, width=32, state="readonly", textvariable=device_var,
+                     values=("cpu", "cuda")).grid(
+                         row=10, column=1, columnspan=2, padx=(10, 0), pady=4)
+
         translation_frame = ttk.LabelFrame(dlg, text=" 英語 → 日本語の字幕翻訳 ", padding=10)
         translation_frame.pack(padx=15, pady=(0, 10), fill="x")
         ttk.Label(translation_frame, text="翻訳モデル:").grid(row=1, column=0, sticky="w", pady=4)
@@ -1698,7 +1712,11 @@ class MeetingRecorderGUI:
             self.REALTIME_BACKEND = REALTIME_BACKENDS[combo_rt.current()][1]
             self.POSTPROCESS_BACKEND = REALTIME_BACKENDS[combo_post.current()][1]
             self.TRANSLATION_MODEL = TRANSLATION_MODELS[combo_translation.current()][1]
-            if old_backend != self.REALTIME_BACKEND:
+            device_changed = self.WHISPER_DEVICE != device_var.get()
+            if device_changed:
+                self.WHISPER_DEVICE = device_var.get()
+                self.WHISPER_COMPUTE = "float16" if self.WHISPER_DEVICE == "cuda" else "int8"
+            if old_backend != self.REALTIME_BACKEND or device_changed:
                 self._preloaded_transcriber = None
             self.SUMMARY_PROVIDER = SUMMARY_PROVIDERS[combo_prov.current()][1]
             self.SUMMARY_MODEL = entry_model.get().strip()
@@ -2740,10 +2758,9 @@ class MeetingRecorderGUI:
                         model_dir, threads=self.FAST_ASR_THREADS,
                         hotwords_file=hotwords, replacements=replacements)
                 else:
-                    from faster_whisper import WhisperModel
                     self.root.after(0, self._log,
                         f"文字起こしモデルを読み込み中... ({self.REALTIME_WHISPER_MODEL})")
-                    self.transcriber = WhisperModel(
+                    self.transcriber = load_whisper_model(
                         self.REALTIME_WHISPER_MODEL,
                         device=self.WHISPER_DEVICE, compute_type=self.WHISPER_COMPUTE)
 

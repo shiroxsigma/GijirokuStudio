@@ -308,7 +308,15 @@ pipenv run python src/main.py --import-video "D:\Videos\meeting.mp4" --video-sna
 | `html_embed_images` | `true` | 画像を HTML に base64 埋め込み |
 | `html_embed_audio` | `false` | 音声も埋め込む（1時間で約37MB増） |
 
-> GPU（CUDA）環境があれば `whisper_device=cuda` / `whisper_compute=float16` にすると、後処理が大幅に高速化します。
+#### Windows で Whisper に NVIDIA GPU を使う
+
+CUDA 12 対応の NVIDIA ドライバーが必要です。初期セットアップ後、プロジェクトのフォルダーで次を実行すると、Whisper 用の cuBLAS と cuDNN がアプリの仮想環境に入ります。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12==9.10.2.21
+```
+
+アプリを起動し、「設定 → 設定を開く」で対象の ASR を「従来（faster-whisper）」、 「Whisper 実行デバイス」を `cuda` にして保存します。デバイス設定はリアルタイム字幕と後処理に共通です。CUDA に切り替えると `float16`、CPU に戻すと `int8` を使います。VRAM が足りない場合は `settings.json` の `whisper_compute` を `int8_float16` に変更できます。
 
 ---
 

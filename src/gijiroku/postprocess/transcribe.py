@@ -4,6 +4,7 @@ import subprocess
 import numpy as np
 from ..paths import FFMPEG_PATH, MODELS_DIR, ROLE_SELF, ROLE_OTHER
 from ..asr.realtime import remove_cross_role_line_duplicates
+from ..asr.whisper import load_whisper_model
 from ..settings import load_app_settings, load_glossary
 
 def build_whisper_prompt(terms):
@@ -144,13 +145,12 @@ class _WhisperEngine:
         self.model = None
         self.name = "moonshine-voice"
         try:
-            from faster_whisper import WhisperModel
             cfg = load_app_settings()
             model_name = cfg.get("whisper_model", "large-v3-turbo")
             device = cfg.get("whisper_device", "cpu")
             compute = cfg.get("whisper_compute", "int8")
             report(None, f"モデル読み込み中: {model_name} ({device})")
-            self.model = WhisperModel(model_name, device=device, compute_type=compute)
+            self.model = load_whisper_model(model_name, device=device, compute_type=compute)
             self.name = f"faster-whisper ({model_name})"
         except ImportError:
             report(None, "faster-whisper 未導入 → moonshine-voice にフォールバック")
