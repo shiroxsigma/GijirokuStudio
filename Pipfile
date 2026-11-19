@@ -33,6 +33,9 @@ python-docx = "*"
 # （onnxruntime を含め約100MB）
 rapidocr-onnxruntime = "*"
 
+[preview]
+windows-capture = "==2.0.1"
+
 [dev-packages]
 
 [requires]

@@ -34,6 +34,7 @@ from .asr.backlog import AudioBacklogQueue
 from .asr.realtime import PartialLeakageGuard, remove_cross_role_duplicates
 from .asr.whisper import load_whisper_model
 from .settings import load_glossary
+from .window_preview import WindowPreview, pick_window
 from .translation import (TRANSLATION_MODELS, DEFAULT_TRANSLATION_MODEL,
                           LocalEnglishJapaneseTranslator, EnglishTranslationWorker,
                           translation_model_dir, TranslationRequest)
@@ -279,6 +280,7 @@ class MeetingRecorderGUI:
         self._transcript_row_counter = 0
         self._recording_dir = None
         self._recording_mon_idx = 0
+        self._recording_window = None
         self._recording_rect = None   # frozen at record start, like the dHash threshold
         self._pipeline_ctx = None
         self._pipeline_thread = None
@@ -454,7 +456,8 @@ class MeetingRecorderGUI:
 
         body = ttk.Frame(self.root)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
         body.rowconfigure(0, weight=1)
         sidebar = ttk.Frame(body)
         sidebar.grid(row=0, column=0, sticky="nsew")
@@ -465,16 +468,13 @@ class MeetingRecorderGUI:
         transcripts.bind("<Map>", self._on_transcript_layout, add="+")
         transcripts.bind("<Configure>", self._on_transcript_layout, add="+")
 
-        frame_info = ttk.LabelFrame(sidebar, text=" システム概要 ", padding=10)
-        frame_info.pack(fill="x", padx=15, pady=(8, 4))
-        ttk.Label(frame_info, justify="left", wraplength=460, text=(
-            "・スピーカー/マイク音声をリアルタイムMP3録音（ffmpegエンコード）\n"
-            "・5秒ごとに画面変化を検知し、スライド切替時のみJPEG保存\n"
-            "・高負荷モード: ローカルAIでリアルタイム文字起こし"
-        )).pack(anchor="w")
-
-        frame_set = ttk.LabelFrame(sidebar, text=" 録画設定 ", padding=10)
-        frame_set.pack(fill="x", padx=15, pady=4)
+        tabs = ttk.Notebook(sidebar)
+        self.preview = WindowPreview(tabs, self._pick_record_window)
+        tabs.add(self.preview, text=" 会議プレビュー ")
+        settings_tab = ttk.Frame(tabs)
+        tabs.add(settings_tab, text=" 録画設定・ログ ")
+        frame_set = ttk.Frame(settings_tab, padding=6)
+        frame_set.pack(fill="x")
 
         ttk.Label(frame_set, text="会議名:").grid(row=0, column=0, sticky="w", pady=2)
         self.entry_meeting = ttk.Entry(frame_set, width=32)
@@ -489,6 +489,9 @@ class MeetingRecorderGUI:
 
         region_row = ttk.Frame(mon_frame)
         region_row.pack(anchor="w", pady=(3, 0))
+        self.pick_record_button = ttk.Button(region_row, text="ウィンドウを選ぶ",
+                                            command=self._pick_record_window)
+        self.pick_record_button.pack(side="left", padx=(0, 4))
         self.btn_region = ttk.Button(region_row, text="🖱 範囲を選択...",
             command=self._select_capture_region)
         self.btn_region.pack(side="left")
@@ -551,7 +554,6 @@ class MeetingRecorderGUI:
         self.chk_microphone.grid(row=6, column=1, padx=10, pady=2, sticky="w")
 
         frame_level = ttk.Frame(sidebar, padding=(15, 2))
-        frame_level.pack(fill="x")
         self._show_level_var = tk.BooleanVar(value=True)
         self.chk_level = tk.Checkbutton(
             frame_level, text="入力レベル:", variable=self._show_level_var,
@@ -564,7 +566,9 @@ class MeetingRecorderGUI:
         self._detect_monitors()
 
         frame_ctrl = ttk.Frame(sidebar, padding=5)
-        frame_ctrl.pack(fill="x", padx=15, pady=4)
+        frame_ctrl.pack(side="bottom", fill="x", padx=15, pady=4)
+        frame_level.pack(side="bottom", fill="x")
+        tabs.pack(fill="both", expand=True, padx=10, pady=(8, 4))
 
         row_buttons = ttk.Frame(frame_ctrl)
         row_buttons.pack(fill="x", pady=3)
@@ -622,7 +626,7 @@ class MeetingRecorderGUI:
             font=("BIZ UDゴシック", 10, "bold"), foreground="#6b7280")
         self.label_status.pack(anchor="w", pady=2)
 
-        frame_log = ttk.LabelFrame(sidebar, text=" 動作ログ ", padding=5)
+        frame_log = ttk.LabelFrame(settings_tab, text=" 動作ログ ", padding=5)
         frame_log.pack(fill="both", expand=True, padx=15, pady=4)
         self.log_area = scrolledtext.ScrolledText(
             frame_log, height=5, width=44, font=("Consolas", 9), state="disabled", wrap="word")
@@ -1347,8 +1351,14 @@ class MeetingRecorderGUI:
 
     def _grab_image(self, sct, rect):
         """Grab a frame and shrink it if its long edge exceeds the limit."""
-        shot = sct.grab(rect)
-        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        if self._recording_window is not None:
+            source = self.preview.latest_image
+            if source is None:
+                raise RuntimeError("会議ウィンドウの映像を取得できません")
+            img = source.copy()
+        else:
+            shot = sct.grab(rect)
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         limit = self.CAPTURE_MAX_EDGE
         if limit and max(img.size) > limit:
             img.thumbnail((limit, limit), Image.LANCZOS)
@@ -1922,8 +1932,25 @@ class MeetingRecorderGUI:
                 else:
                     vals.append(f"画面 [{i}]: ディスプレイ {i} ({m['width']}x{m['height']})")
             vals.append(REGION_CHOICE)
+            self._monitor_choices = vals
+            self._window_choices = {}
             self.combo_monitor["values"] = vals
             self.combo_monitor.current(0)
+
+    def _pick_record_window(self):
+        target = pick_window(self.root)
+        if target is None:
+            return
+        title, hwnd = target
+        self.preview.start_window(title, hwnd)
+        if self.preview.control is None:
+            messagebox.showerror("画面取得エラー", self.preview.status["text"])
+            return
+        label = f"ウィンドウ: {title}"
+        self._window_choices = {label: target}
+        self.combo_monitor.configure(values=self._monitor_choices + [label])
+        self.combo_monitor.set(label)
+        self._update_region_label()
 
     # -------------------------------------------------------------- Control
 
@@ -1952,6 +1979,21 @@ class MeetingRecorderGUI:
             self._recording_selected_audio = selected
             if not self._validate_region():
                 return
+            choice = self.combo_monitor.get()
+            self._recording_window = self._window_choices.get(choice)
+            if self._recording_window:
+                if self.preview.control is None:
+                    self.preview.start_window(*self._recording_window)
+                if self.preview.control is None:
+                    messagebox.showerror("画面取得エラー", self.preview.status["text"])
+                    self._recording_window = None
+                    return
+                self.preview.stop_button.configure(state="disabled")
+            elif choice not in self._monitor_choices:
+                messagebox.showwarning("対象画面", "対象のウィンドウを選び直してください。")
+                return
+            self.preview.pick_button.configure(state="disabled")
+            self.pick_record_button.configure(state="disabled")
             self._meeting_name = self.entry_meeting.get().strip()
             self.is_recording = True
             self.stop_event.clear()
@@ -2004,6 +2046,11 @@ class MeetingRecorderGUI:
         if self._close_after_save:
             self.root.destroy()
             return
+        self._recording_window = None
+        self.preview.pick_button.configure(state="normal")
+        self.pick_record_button.configure(state="normal")
+        if self.preview.control is not None:
+            self.preview.stop_button.configure(state="normal")
         self.is_recording = False
         self.stop_event.clear()
         self._audio_level = 0.0
@@ -2134,7 +2181,10 @@ class MeetingRecorderGUI:
         snap_count = 0
         with mss.MSS() as sct:
             monitor = self._recording_rect or self._capture_rect(sct)
-            self.root.after(0, self._log,
+            if self._recording_window:
+                self.root.after(0, self._log, f"キャプチャ対象: {self._recording_window[0]}")
+            else:
+                self.root.after(0, self._log,
                 f"キャプチャ対象: {monitor['width']}×{monitor['height']} "
                 f"(x={monitor['left']}, y={monitor['top']})")
             while self.is_recording and not self.stop_event.is_set():

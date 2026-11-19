@@ -2,6 +2,7 @@
 # Install: python -m pip install -r requirements.txt
 # Torch / Transformers are used only in a temporary model conversion environment.
 mss==10.2.0
+windows-capture==2.0.1; sys_platform == "win32"
 pillow==12.3.0
 imagehash==4.3.2
 pyaudiowpatch==0.2.12.8

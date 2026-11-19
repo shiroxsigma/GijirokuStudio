@@ -58,7 +58,7 @@ if errorlevel 1 goto failed
 :sync_dependencies
 echo [3/5] Pipfile.lockから実行用ライブラリを導入
 set "SETUP_STEP=Pipenvでの仮想環境・実行用ライブラリの導入"
-%SETUP_HOST% -m pipenv sync --python 3.13 --categories "default local"
+%SETUP_HOST% -m pipenv sync --python 3.13 --categories "default local preview"
 if errorlevel 1 goto failed
 "%SETUP_PYTHON%" -c "import sys, struct; sys.exit(0 if sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if errorlevel 1 goto python_invalid

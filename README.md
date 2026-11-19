@@ -83,7 +83,7 @@ Pipenvでの `.venv` の作成、`Pipfile.lock` の `default`・`local` に固�
 ```bash
 # 1) 仮想環境を作成して依存パッケージをインストール
 python -m pipenv --python 3.13     # open_py313.bat と同等
-pipenv sync --categories "default local" # 録音・ローカルASR・翻訳の固定バージョンを導入
+pipenv sync --categories "default local preview" # 録音・ローカルASR・翻訳・会議プレビューを導入
 ```
 
 pip を直接使う場合は `python -m pip install -r requirements.txt` で録音・文字起こし・
@@ -161,6 +161,8 @@ python src/main.py --post-process "<会議フォルダのパス>" --postprocess-
 ---
 
 ## 🎬 使い方
+
+「会議プレビュー」または「録画設定・ログ」の「ウィンドウを選ぶ」を押し、Teams や Edge のウィンドウをクリックします。アプリが手前に戻り、選んだ映像がプレビューと記録対象の両方に設定されます。Esc で選択を取り消せます。プレビューは録音前から使えます。「録画設定・ログ」で高負荷モードを選び、記録を開始すると、右側にリアルタイム字幕が表示されます。
 
 1. **会議名を入力**（省略可。フォルダ名・議事録タイトルに使われます）
 2. **対象画面** と **音声デバイス** を選択
