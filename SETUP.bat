@@ -22,11 +22,9 @@ if not exist "Pipfile.lock" goto failed
 if not exist "src\main.py" goto failed
 if not exist "src\setup_fast_asr.py" goto failed
 if not exist "src\setup_translation.py" goto failed
-if not exist "ffmpeg.exe" goto ffmpeg_missing
-"%CD%\ffmpeg.exe" -version >nul 2>&1
-if errorlevel 1 goto ffmpeg_invalid
+if not exist "src\setup_ffmpeg.py" goto failed
 
-echo [1/4] Python 3.13 とPipenvを準備
+echo [1/5] Python 3.13 を確認
 set "SETUP_STEP=Python・Pipenvの確認"
 py -3.13 -c "import sys, struct; sys.exit(0 if sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if not errorlevel 1 goto use_launcher
@@ -47,25 +45,30 @@ goto ensure_pipenv
 if errorlevel 1 goto python_invalid
 
 :ensure_pipenv
+echo [2/5] FFmpeg を準備
+set "SETUP_STEP=FFmpegの導入"
+%SETUP_HOST% "src\setup_ffmpeg.py"
+if errorlevel 1 goto failed
+set "SETUP_STEP=Pipenvの準備"
 %SETUP_HOST% -m pipenv --version >nul 2>&1
 if not errorlevel 1 goto sync_dependencies
 %SETUP_HOST% -m pip install --user "pipenv==2025.0.4"
 if errorlevel 1 goto failed
 
 :sync_dependencies
-echo [2/4] Pipfile.lockから実行用ライブラリを導入
+echo [3/5] Pipfile.lockから実行用ライブラリを導入
 set "SETUP_STEP=Pipenvでの仮想環境・実行用ライブラリの導入"
 %SETUP_HOST% -m pipenv sync --python 3.13 --categories "default local"
 if errorlevel 1 goto failed
 "%SETUP_PYTHON%" -c "import sys, struct; sys.exit(0 if sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if errorlevel 1 goto python_invalid
 
-echo [3/4] 日英文字起こしモデルを導入
+echo [4/5] 日英文字起こしモデルを導入
 set "SETUP_STEP=日英文字起こしモデルの導入"
 %SETUP_HOST% -m pipenv run python "src\setup_fast_asr.py"
 if errorlevel 1 goto failed
 
-echo [4/4] 省電力の英日翻訳モデルを導入
+echo [5/5] 省電力の英日翻訳モデルを導入
 set "SETUP_STEP=英日翻訳モデルの導入"
 %SETUP_HOST% -m pipenv run python "src\setup_translation.py" --model elan-tiny
 if errorlevel 1 goto failed
@@ -91,14 +94,6 @@ goto failed
 :python_invalid
 echo [エラー] 既存の .venv がPython 3.13の64bit版ではないか、起動できません。
 echo .venv を別名に退避してから再実行してください。
-goto failed
-
-:ffmpeg_missing
-echo [エラー] このbatと同じフォルダに ffmpeg.exe を配置してください。
-goto failed
-
-:ffmpeg_invalid
-echo [エラー] ffmpeg.exe を起動できません。Windows用の実行ファイルを確認してください。
 goto failed
 
 :failed
