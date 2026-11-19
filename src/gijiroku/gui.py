@@ -1879,6 +1879,7 @@ class MeetingRecorderGUI:
             ms = f"{now.microsecond // 1000:03d}"
             fname = f"manual_{ts}_{ms}.jpg"
             img.save(os.path.join(self._recording_dir, fname), "JPEG", quality=self.JPEG_QUALITY)
+            self.root.after(0, self.preview.flash_snapshot)
             self._log(f"手動キャプチャ -> {fname}")
             self._write_snapshot_log(fname, "manual", None)
         except Exception as e:
@@ -2248,6 +2249,7 @@ class MeetingRecorderGUI:
                     ms = f"{datetime.datetime.now().microsecond // 1000:03d}"
                     fname = f"snapshot_{ts}_{ms}.jpg"
                     img.save(os.path.join(dir_name, fname), "JPEG", quality=self.JPEG_QUALITY)
+                    self.root.after(0, self.preview.flash_snapshot)
                     self.root.after(0, self._log, f"画面変化検知 -> {fname} (diff={diff})")
                     self._write_snapshot_log(fname, "auto", diff)
                     last_hash = h

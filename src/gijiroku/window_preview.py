@@ -7,7 +7,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 
 def pick_window(root):
@@ -82,10 +82,38 @@ class WindowPreview(ttk.Frame):
         self.stop_button.pack(side="right")
         self.canvas = tk.Canvas(self, width=240, height=160, bg="#18212b", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        self._snapshot_item = self.canvas.create_image(0, 0, anchor="ne", state="hidden")
+        self._snapshot_timer = None
+        self._snapshot_photo = None
         self.status = ttk.Label(self, text="取り込むウィンドウをクリックしてください（Esc でキャンセル）",
                                 wraplength=440)
         self.status.pack(anchor="w", pady=(4, 0))
         self.bind("<Destroy>", self._destroy, add="+")
+
+    def flash_snapshot(self):
+        """Briefly overlay a fading capture indicator on the preview canvas."""
+        if self._snapshot_timer is not None:
+            self.after_cancel(self._snapshot_timer)
+        started = time.monotonic()
+
+        def fade():
+            opacity = max(0, 1 - (time.monotonic() - started) / 0.65)
+            if opacity == 0:
+                self.canvas.itemconfigure(self._snapshot_item, image="", state="hidden")
+                self._snapshot_photo = None
+                self._snapshot_timer = None
+                return
+            dot = Image.new("RGBA", (48, 48))
+            ImageDraw.Draw(dot).ellipse((2, 2, 45, 45),
+                fill=(237, 76, 80, round(255 * opacity)),
+                outline=(255, 255, 255, round(240 * opacity)), width=4)
+            self._snapshot_photo = ImageTk.PhotoImage(
+                dot.resize((12, 12), Image.Resampling.LANCZOS), master=self.canvas)
+            self.canvas.coords(self._snapshot_item, self.canvas.winfo_width() - 10, 10)
+            self.canvas.itemconfigure(self._snapshot_item, image=self._snapshot_photo, state="normal")
+            self._snapshot_timer = self.after(40, fade)
+
+        fade()
 
     def reconnect(self):
         if self.target is not None:
@@ -162,6 +190,7 @@ class WindowPreview(ttk.Frame):
                 self.photo = ImageTk.PhotoImage(source.resize(target, Image.Resampling.BILINEAR))
                 self.canvas.delete("frame")
                 self.canvas.create_image(size[0]//2, size[1]//2, image=self.photo, tags="frame")
+                self.canvas.tag_lower("frame")
                 last_size = size
                 needs_draw = False
 
@@ -184,7 +213,12 @@ class WindowPreview(ttk.Frame):
         self.status.configure(text="プレビュー停止中")
 
     def _destroy(self, event):
-        if event.widget is self and self.control is not None:
+        if event.widget is not self:
+            return
+        if self._snapshot_timer is not None:
+            self.after_cancel(self._snapshot_timer)
+            self._snapshot_timer = None
+        if self.control is not None:
             if not self.control.is_finished():
                 self.control.stop()
             self.control = None
