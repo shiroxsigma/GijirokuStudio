@@ -36,8 +36,7 @@ from .asr.whisper import load_whisper_model
 from .settings import load_glossary
 from .window_preview import WindowPreview, pick_window
 from .translation import (TRANSLATION_MODELS, DEFAULT_TRANSLATION_MODEL,
-                          LocalEnglishJapaneseTranslator, EnglishTranslationWorker,
-                          translation_model_dir, TranslationRequest)
+                          create_translation_model, EnglishTranslationWorker, TranslationRequest)
 from .postprocess.data import _read_jsonl, _read_metadata
 from .postprocess.transcribe import detect_ja_en
 from .postprocess.render import fmt_timestamp
@@ -2910,14 +2909,13 @@ class MeetingRecorderGUI:
         self._stop_translation()
         name = self.TRANSLATION_MODEL
         threads = self.TRANSLATION_THREADS
-        model_dir = translation_model_dir(name)
 
         def load_model():
             key = (name, threads)
             if self._translation_model_key != key or self._translation_model is None:
                 self._translation_model = None
                 self._translation_model_key = None
-                self._translation_model = LocalEnglishJapaneseTranslator(model_dir, threads)
+                self._translation_model = create_translation_model(name, threads)
                 self._translation_model_key = key
             return self._translation_model
 

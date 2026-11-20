@@ -1,6 +1,7 @@
-"""Download and convert the optional local English-to-Japanese model once."""
+"""Install an optional local English-to-Japanese translation model."""
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import venv
 from pathlib import Path
 
 from gijiroku.translation import (TRANSLATION_MODELS, DEFAULT_TRANSLATION_MODEL,
-                                 translation_model_dir)
+                                 plamo_ollama_tag, translation_model_dir)
 
 CONVERSION_VERSION = 2
 
@@ -89,6 +90,19 @@ def main():
     args = parser.parse_args()
     if args._convert is not None:
         download_and_convert(*args._convert)
+        return
+    tag = plamo_ollama_tag(args.model)
+    if tag:
+        try:
+            subprocess.run(["ollama", "pull", tag], check=True,
+                           env={**os.environ, "OLLAMA_HOST": "http://127.0.0.1:11434"})
+        except FileNotFoundError:
+            parser.exit(1, "Ollama が見つかりません。https://ollama.com/download/windows から"
+                           "インストールし、新しい端末で再実行してください。\n")
+        except subprocess.CalledProcessError:
+            parser.exit(1, "モデルを取得できませんでした。Ollama を起動し、インターネット接続と"
+                           "ディスクの空き容量を確認して再実行してください。\n")
+        print(f"翻訳モデル導入済み: {tag}")
         return
     destination = translation_model_dir(args.model)
     manifest = destination / "installation.json"

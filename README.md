@@ -116,10 +116,26 @@ CPU向けの `sherpa-onnx`、日本語ReazonSpeech、英語Parakeet、日英言�
 .venv\Scripts\python.exe src/setup_translation.py --model fugumt
 ```
 
-既定は省電力向けのElanMT-tinyです。モデルはINT8で
+既定は省電力向けのElanMT-tinyです。ElanMT-tiny と FuguMT は INT8 で
 `models/translation_en_ja/` に保存します。導入時だけネット接続とPyTorch・Transformersが
 必要です。変換用ライブラリは一時環境に導入し、完了・失敗時に削除します。
 アプリの実行環境には残りません。会議中はCTranslate2・SentencePiece・sacremosesでローカル処理します。
+
+PLaMo 3 Translate を使う場合は、Windows 版 Ollama をインストールして起動します。[Ollama ダウンロード](https://ollama.com/download/windows)
+
+容量を抑えたい場合は 0.8B を選べます。2B はより大きく、開発元の英日翻訳評価で 0.8B より高いスコアを記録しています。[公式の評価・サイズ比較](https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF#model-list)
+
+プロジェクトのフォルダーで、使うサイズのコマンドを実行してください。公式 GGUF の Q4_K_M 版を Ollama のモデル保存先にダウンロードします。
+
+```powershell
+# 0.8B（約0.57 GB）
+.\.venv\Scripts\python.exe src/setup_translation.py --model plamo-3-translate-0.8b
+# 2B（約1.81 GB）
+.\.venv\Scripts\python.exe src/setup_translation.py --model plamo-3-translate-2b
+```
+
+「設定 → 設定を開く」の「翻訳モデル」で導入したサイズを選び、保存します。会議中は Ollama を起動しておいてください。英語の確定字幕が同じ PC の Ollama（`127.0.0.1:11434`）で日本語に翻訳されます。配布ファイル、評価結果、利用条件は各モデルカードに記載されています。[0.8B モデルカード](https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF)・[2B モデルカード](https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF)
+
 翻訳は起動時OFFです。左の操作欄にある「英語 → 日本語の翻訳を使う」にチェックを入れると、
 以後の英語の確定字幕を翻訳します。録音中も切り替えられます。チェックを外すと新しい翻訳と待機中の翻訳を停止します。
 処理中の一文は完了する場合があります。OFFでは日本語表示欄を隠し、原文欄を広く表示します。

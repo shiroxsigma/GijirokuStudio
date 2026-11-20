@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import http.client
 import json
 from pathlib import Path
 import queue
@@ -11,15 +12,27 @@ import threading
 from .paths import BASE_DIR
 
 
-TRANSLATION_MODELS = [
+MARIAN_MODELS = [
     ("ElanMT-tiny（省電力）", "elan-tiny", "Mitsua/elan-mt-tiny-en-ja"),
     ("FuguMT（標準）", "fugumt", "staka/fugumt-en-ja"),
 ]
+PLAMO_MODELS = [
+    ("PLaMo 3 Translate 0.8B（Ollama）", "plamo-3-translate-0.8b", "pfnet/plamo-3-translate-0.8b-GGUF"),
+    ("PLaMo 3 Translate 2B（Ollama）", "plamo-3-translate-2b", "pfnet/plamo-3-translate-2b-GGUF"),
+]
+TRANSLATION_MODELS = MARIAN_MODELS + PLAMO_MODELS
 DEFAULT_TRANSLATION_MODEL = "elan-tiny"
 
 
+def plamo_ollama_tag(name):
+    for _, model_name, repository in PLAMO_MODELS:
+        if model_name == name:
+            return f"hf.co/{repository}:Q4_K_M"
+    return None
+
+
 def translation_model_dir(name):
-    if name not in {item[1] for item in TRANSLATION_MODELS}:
+    if name not in {item[1] for item in MARIAN_MODELS}:
         raise ValueError(f"不明な翻訳モデル: {name}")
     return Path(BASE_DIR) / "models" / "translation_en_ja" / name
 
@@ -32,7 +45,7 @@ class LocalEnglishJapaneseTranslator:
         required = ("model.bin", "config.json", "source.spm", "target.spm")
         if not all((model_dir / name).is_file() for name in required):
             option = f" --model {model_dir.name}" if model_dir.name in {
-                item[1] for item in TRANSLATION_MODELS} else ""
+                item[1] for item in MARIAN_MODELS} else ""
             raise RuntimeError(
                 f"翻訳モデル未導入。python src/setup_translation.py{option} を実行してください")
         import ctranslate2
@@ -61,6 +74,55 @@ class LocalEnglishJapaneseTranslator:
                 if translated:
                     output.append(translated)
         return " ".join(output)
+
+
+class OllamaModelUnavailable(RuntimeError):
+    """The local service or selected model needs to be installed or started."""
+
+
+class PlamoTranslator:
+    def __init__(self, model_tag, threads):
+        self.model_tag = model_tag
+        self.threads = threads
+
+    def translate(self, text):
+        payload = {
+            "model": self.model_tag,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "[plamo-translate]\ntarget_lang=ja\nsource_lang=en"},
+                {"role": "user", "content": text},
+            ],
+            "options": {"temperature": 0, "num_predict": 512, "num_thread": self.threads,
+                        "stop": ["<|plamo:tag|>", "<|plamo:bos|>"]},
+        }
+        connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=60)
+        try:
+            connection.request("POST", "/api/chat", body=json.dumps(payload).encode("utf-8"),
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            if response.status == 404:
+                raise OllamaModelUnavailable(
+                    f"翻訳モデル未導入。ollama pull {self.model_tag} を実行してください")
+            result = json.loads(response.read())
+            if response.status != 200 or result.get("error"):
+                raise RuntimeError(f"Ollama翻訳エラー: {result.get('error') or response.status}")
+            if result.get("done_reason") == "length":
+                raise RuntimeError("翻訳結果が出力上限に達しました。英文は保存されています")
+            return result["message"]["content"].strip()
+        except ConnectionRefusedError as exc:
+            raise OllamaModelUnavailable("Ollamaに接続できません。Ollamaを起動してください") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Ollamaの翻訳がタイムアウトしました") from exc
+        finally:
+            connection.close()
+
+
+def create_translation_model(name, threads=1):
+    tag = plamo_ollama_tag(name)
+    if tag:
+        return PlamoTranslator(tag, threads)
+    return LocalEnglishJapaneseTranslator(translation_model_dir(name), threads)
 
 
 @dataclass(frozen=True)
@@ -175,6 +237,8 @@ class EnglishTranslationWorker:
                     transcript.flush()
                     self._on_result(request, translated)
                 except Exception as exc:
+                    if isinstance(exc, OllamaModelUnavailable):
+                        self._failed.set()
                     self._on_error(str(exc))
                     self._on_skipped(request, "翻訳できませんでした")
                 finally:
